@@ -185,6 +185,110 @@ namespace sfc_gen
         }
     }
 
+    inline void seg_convexCover(const std::vector<Eigen::Vector3d> &path,
+                            const std::vector<Eigen::Vector3d> &points,
+                            const Eigen::Vector3d &lowCorner,
+                            const Eigen::Vector3d &highCorner,
+                            const double &progress,
+                            const double &range,
+                            std::vector<Eigen::MatrixX4d> &hpolys,
+                            const double eps = 1.0e-6,
+                            bool use_overlap = true,
+                            bool segments_only = false) // <— new flag
+    {
+        hpolys.clear();
+        const int n = static_cast<int>(path.size());
+        if (n < 2)
+            return;
+
+        // Axis-aligned 6 bounding planes (AABB)
+        Eigen::Matrix<double, 6, 4> bd = Eigen::Matrix<double, 6, 4>::Zero();
+        bd(0, 0) = 1.0;
+        bd(1, 0) = -1.0;
+        bd(2, 1) = 1.0;
+        bd(3, 1) = -1.0;
+        bd(4, 2) = 1.0;
+        bd(5, 2) = -1.0;
+
+        auto setAABB = [&](const Eigen::Vector3d &a, const Eigen::Vector3d &b)
+        {
+            bd(0, 3) = -std::min(std::max(a(0), b(0)) + range, highCorner(0));
+            bd(1, 3) = std::max(std::min(a(0), b(0)) - range, lowCorner(0));
+            bd(2, 3) = -std::min(std::max(a(1), b(1)) + range, highCorner(1));
+            bd(3, 3) = std::max(std::min(a(1), b(1)) - range, lowCorner(1));
+            bd(4, 3) = -std::min(std::max(a(2), b(2)) + range, highCorner(2));
+            bd(5, 3) = std::max(std::min(a(2), b(2)) - range, lowCorner(2));
+        };
+
+        auto build_pc = [&](Eigen::Matrix<double, 3, Eigen::Dynamic> &pc)
+        {
+            std::vector<Eigen::Vector3d> valid_pc;
+            valid_pc.reserve(points.size());
+            for (const auto &p : points)
+                if ((bd.leftCols<3>() * p + bd.rightCols<1>()).maxCoeff() < 0.0)
+                    valid_pc.emplace_back(p);
+            pc.resize(3, static_cast<int>(valid_pc.size()));
+            for (int k = 0; k < pc.cols(); ++k)
+                pc.col(k) = valid_pc[k];
+        };
+
+        Eigen::MatrixX4d hp, gap;
+
+        // === SEGMENT-ONLY MODE: exactly one poly per segment, no overlap ===
+        if (segments_only)
+        {
+            for (int i = 0; i < n - 1; ++i)
+            {
+                const Eigen::Vector3d &a = path[i];
+                const Eigen::Vector3d &b = path[i + 1];
+
+                setAABB(a, b);
+                Eigen::Matrix<double, 3, Eigen::Dynamic> pc;
+                build_pc(pc);
+
+                // Build corridor poly for this exact segment [a,b]
+                firi::firi(bd, pc, a, b, hp);
+                hpolys.emplace_back(std::move(hp));
+            }
+            return;
+        }
+
+        // === ORIGINAL STEPPING MODE (progress-based), with optional overlap gaps ===
+        Eigen::Vector3d a, b = path[0];
+        for (int i = 1; i < n;)
+        {
+            a = b;
+            if ((a - path[i]).norm() > progress)
+            {
+                b = (path[i] - a).normalized() * progress + a;
+            }
+            else
+            {
+                b = path[i];
+                i++;
+            }
+
+            setAABB(a, b);
+            Eigen::Matrix<double, 3, Eigen::Dynamic> pc;
+            build_pc(pc);
+
+            firi::firi(bd, pc, a, b, hp);
+
+            if (!hpolys.empty() && use_overlap)
+            {
+                const Eigen::Vector4d ah(a(0), a(1), a(2), 1.0);
+                // If the new and previous polytopes both contain 'a' (within eps), add a small joint poly
+                if (3 <= ((hp * ah).array() > -eps).cast<int>().sum() + ((hpolys.back() * ah).array() > -eps).cast<int>().sum())
+                {
+                    firi::firi(bd, pc, a, a, gap, 1);
+                    hpolys.emplace_back(gap);
+                }
+            }
+
+            hpolys.emplace_back(hp);
+        }
+    }
+
     inline void shortCut(std::vector<Eigen::MatrixX4d> &hpolys)
     {
         std::vector<Eigen::MatrixX4d> htemp = hpolys;

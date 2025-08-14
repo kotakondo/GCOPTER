@@ -46,6 +46,8 @@ namespace gcopter
         typedef Eigen::MatrixX4d PolyhedronH;
         typedef std::vector<PolyhedronV> PolyhedraV;
         typedef std::vector<PolyhedronH> PolyhedraH;
+        Eigen::Matrix3Xd initial_guess_points_;
+        Eigen::VectorXd initial_guess_times_;
 
     private:
         minco::MINCO_S3NU minco;
@@ -84,6 +86,8 @@ namespace gcopter
         Eigen::VectorXd gradByTimes;
         Eigen::MatrixX3d partialGradByCoeffs;
         Eigen::VectorXd partialGradByTimes;
+
+        std::vector<Eigen::MatrixX4d> piece_corridor_;
 
     private:
         static inline void forwardT(const Eigen::VectorXd &tau,
@@ -824,6 +828,10 @@ namespace gcopter
             lbfgs_params.g_epsilon = 0.0;
             lbfgs_params.delta = relCostTol;
 
+            // save initial guess
+            initial_guess_points_ = points;
+            initial_guess_times_ = times;
+
             int ret = lbfgs::lbfgs_optimize(x,
                                             minCostFunctional,
                                             &GCOPTER_PolytopeSFC::costFunctional,
@@ -849,6 +857,13 @@ namespace gcopter
             }
 
             return minCostFunctional;
+        }
+
+        void getInitialGuess(Eigen::Matrix3Xd &points,
+                                     Eigen::VectorXd &times) const
+        {
+            points = initial_guess_points_;
+            times = initial_guess_times_;
         }
     };
 

@@ -21,7 +21,7 @@ mkdir -p test_ws/src
 cd test_ws/src
 git clone -b ros2 https://github.com/yuwei-wu/GCOPTER.git
 cd ../
-colcon build
+colcon build --cmake-args -DCMAKE_INSTALL_PREFIX="$HOME/.local" -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++ ..
 source install/setup.bash
 ros2 launch gcopter global_planning.launch.py
 ```

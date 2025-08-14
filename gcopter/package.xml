@@ -26,8 +26,11 @@
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>decomp_ros_msgs</exec_depend>
   <exec_depend>ompl</exec_depend>
   <exec_depend>eigen3_cmake_module</exec_depend>
+  <depend>decomp_rviz_plugins</depend>
 
   <!-- Export -->
   <export>

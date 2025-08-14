@@ -29,6 +29,12 @@
 #include <memory>
 #include <vector>
 #include <Eigen/Eigen>
+#include <dynus/lbfgs_solver_utils.hpp>
+#include <dynus/dynus_type.hpp>
+#include <decomp_util/ellipsoid_decomp.h>
+#include <decomp_util/seed_decomp.h>
+#include <decomp_util/ellipsoid_decomp.h>
+#include <decomp_util/seed_decomp.h>
 
 namespace voxel_map
 {
@@ -54,6 +60,19 @@ namespace voxel_map
               bounds((mapSize.array() - 1) * step.array()),
               stepScale(step.cast<double>().cwiseInverse() * scale),
               voxels(voxNum, Unoccupied) {}
+
+        // Export obstacle points for convex decomposition (ellipsoid/FIRI).
+        // If `surface_only == true`, uses the existing surface extractor (recommended).
+        // Otherwise, returns centers of all occupied voxels (heavier; usually unnecessary).
+        inline void getObsForDecomp(vec_Vecf<3> &vec_uo,
+                                    bool surface_only = true,
+                                    int stride = 1) const;
+
+        // Convenience alias: always surface points.
+        inline void getSurfaceObsForDecomp(vec_Vecf<3> &vec_uo) const
+        {
+            getObsForDecomp(vec_uo, /*surface_only=*/true);
+        }
 
     private:
         Eigen::Vector3i mapSize;
@@ -225,6 +244,49 @@ namespace voxel_map
             return ((pos - o) / scale).cast<int>();
         }
     };
+
+    inline void VoxelMap::getObsForDecomp(vec_Vecf<3> &vec_uo,
+                                          bool surface_only,
+                                          int stride) const
+    {
+        vec_uo.clear();
+    
+        if (surface_only)
+        {
+            // Use the existing surface extractor for better, “shell-only” obstacles.
+            std::vector<Eigen::Vector3d> surf;
+            getSurf(surf); // already available in your VoxelMap
+            vec_uo.reserve(surf.size());
+            for (const auto &p : surf)
+                vec_uo.emplace_back(p.x(), p.y(), p.z());
+            return;
+        }
+    
+        // Fallback: enumerate all occupied voxels (centers).
+        // Reconstruct grid dims from box + voxel size to avoid needing a private getter.
+        const Eigen::Vector3d org = getOrigin();
+        const Eigen::Vector3d cor = getCorner();
+        const double h = getScale(); // voxel width
+    
+        const Eigen::Vector3i dims = ((cor - org) / h + Eigen::Vector3d(1e-9, 1e-9, 1e-9)).array().floor().cast<int>();
+    
+        if (stride < 1)
+            stride = 1;
+        vec_uo.reserve((dims[0] / stride + 1) * (dims[1] / stride + 1) * (dims[2] / stride + 1));
+    
+        for (int ix = 0; ix < dims[0]; ix += stride)
+            for (int iy = 0; iy < dims[1]; iy += stride)
+                for (int iz = 0; iz < dims[2]; iz += stride)
+                {
+                    // center of voxel (ix,iy,iz)
+                    Eigen::Vector3d c = org + h * (Eigen::Vector3d(ix + 0.5, iy + 0.5, iz + 0.5));
+                    // VoxelMap::query(c) returns 0 for free; nonzero for occupied
+                    if (query(c) != 0)
+                        vec_uo.emplace_back(c.x(), c.y(), c.z());
+                }
+    }
+
 }
+
 
 #endif
