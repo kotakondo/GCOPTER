@@ -4,8 +4,8 @@
     TargetTopic:                '/goal_pose'
     DilateRadius:               0.5
     VoxelWidth:                 0.25
-    MapBound:                   [-40.0, 40.0, -40.0, 40.0, 0.0, 5.0]
-    TimeoutRRT:                 0.1
+    MapBound:                   [-100.0, 100.0, -100.0, 100.0, 0.0, 5.0]
+    TimeoutRRT:                 5.0
     MaxVelMag:                  6.0
     MaxBdrMag:                  2.1
     MaxTiltAngle:               1.05
@@ -17,20 +17,31 @@
     VertDrag:                   0.80
     ParasDrag:                  0.01
     SpeedEps:                   0.0001
-    WeightT:                    20.0
+    WeightT:                    1.0e+3  
     ChiVec:                     [1.0e+4, 1.0e+4, 1.0e+4, 1.0e+4, 1.0e+5] # [pos, vel, omega, theta, thrust]
     SmoothingEps:               1.0e-2
     IntegralIntervs:            16
-    RelCostTol:                 1.0e-5
+    RelCostTol:                 1.0e-6
     ExportCSVDir:               '/home/kkondo/data/gcopter_csv'
     SampleDt:                   0.01
 
     # MIGHTY-specific parameters
-    MIGHTYJerkWeight:           1.0e-4
+    MIGHTYJerkWeight:           1.0e-1
+    MIGHTYWeightT:              1.0e+3
+    MIGHTYPosWeight:            1.0e+4
+    MIGHTYVelWeight:            1.0e+4
+    MIGHTYOmegaWeight:          1.0e+4
+    MIGHTYThetaWeight:          1.0e+4
+    MIGHTYThrustWeight:         1.0e+5
+    OrientSmoothWeight:         0.0
+    TiltBiasWeight:             0.0
+    TvarWeight:                 0.0
+    TminWeight:                 0.0
+    TminPlan:                   0.0
 
     # Collision checking parameters
     CollisionDt:                 0.01
 
     # safe corridor parameters
-    sfc_progress:             0.5
-    sfc_range:                2.0
+    sfc_progress:             3.0
+    sfc_range:                7.0

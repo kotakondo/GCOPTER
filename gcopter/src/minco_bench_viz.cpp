@@ -79,7 +79,18 @@ struct Config
     double sampleDt; // seconds
 
     // MIGHTY-specific
+    double mightyWeightT; // w_T for MIGHTY (LBFGS)
+    double mightyPosWeight; // w_pos for MIGHTY (LBFGS)
+    double mightyVelWeight; // w_vel for MIGHTY (LBFGS)
+    double mightyOmegaWeight; // w_omega for MIGHTY (LBFGS)
+    double mightyThetaWeight; // w_theta for MIGHTY (LBFGS)
+    double mightyThrustWeight; // w_thrust for MIGHTY (LBFGS
     double mightyJerkWeight; // Jerk weight for MIGHTY (LBFGS
+    double orientSmoothWeight; // w_orient_smooth
+    double tiltBiasWeight;     // w_tilt_bias
+    double tvarWeight;         // w_tvar
+    double TminWeight;         // w_Tmin
+    double TminPlan;           // Tmin for planning
 
     // Collision checking
     double collisionDt; // sampling step for collision checking
@@ -87,6 +98,9 @@ struct Config
     // Safe corridor parameters
     double sfc_progress; // progress along the route for corridor generation
     double sfc_range;    // range around the route for corridor generation
+
+    // Benchmarking
+    bool do_benchmark = false; // if false, just visualize once
 
     Config(rclcpp::Node &node)
     {
@@ -111,15 +125,27 @@ struct Config
         node.declare_parameter("SpeedEps", 1.0e-4);
         node.declare_parameter("WeightT", 20.0);
         node.declare_parameter("ChiVec", std::vector<double>{1.0e4, 1.0e4, 1.0e4, 1.0e4, 1.0e5});
+        node.declare_parameter("OrientSmoothWeight", 0.0); // w_orient_smooth
+        node.declare_parameter("TiltBiasWeight", 0.0);     // w_tilt_bias
+        node.declare_parameter("TvarWeight", 0.0);         // w_tvar
+        node.declare_parameter("TminWeight", 0.0); // w_Tmin
+        node.declare_parameter("TminPlan", 0.0);
         node.declare_parameter("SmoothingEps", 1.0e-2);
         node.declare_parameter("IntegralIntervs", 16);
         node.declare_parameter("RelCostTol", 1.0e-5);
         node.declare_parameter("ExportCSVDir", std::string("")); // empty => no export
         node.declare_parameter("SampleDt", 0.02);                // seconds
-        node.declare_parameter("MIGHTYJerkWeight", 0.1); // Jerk weight for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYWeightT", 10.0); // w_T for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYPosWeight", 1.0e+4); // w_pos for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYVelWeight", 1.0e+4); // w_vel for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYOmegaWeight", 1.0e+4); // w_omega for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYThetaWeight", 1.0e+4); // w_theta for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYThrustWeight", 1.0e+5); // w_thrust for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYJerkWeight", 0.1);         // Jerk weight for MIGHTY (LBFGS)
         node.declare_parameter("CollisionDt", 0.01);
-        node.declare_parameter("sfc_progress", 0.5); // progress along the route for corridor generation
-        node.declare_parameter("sfc_range", 3.0);    // range around
+        node.declare_parameter("sfc_progress", 0.5);   // progress along the route for corridor generation
+        node.declare_parameter("sfc_range", 3.0);      // range around
+        node.declare_parameter("do_benchmark", false); // if false, just visualize once
 
         // Get parameters from the node
         node.get_parameter("MapTopic", mapTopic);
@@ -142,15 +168,51 @@ struct Config
         node.get_parameter("SpeedEps", speedEps);
         node.get_parameter("WeightT", weightT);
         node.get_parameter("ChiVec", chiVec);
+        node.get_parameter("OrientSmoothWeight", orientSmoothWeight);
+        node.get_parameter("TiltBiasWeight", tiltBiasWeight);
+        node.get_parameter("TvarWeight", tvarWeight);
+        node.get_parameter("TminWeight", TminWeight);
+        node.get_parameter("TminPlan", TminPlan);
         node.get_parameter("SmoothingEps", smoothingEps);
         node.get_parameter("IntegralIntervs", integralIntervs);
         node.get_parameter("RelCostTol", relCostTol);
         node.get_parameter("ExportCSVDir", exportCSVDir);
         node.get_parameter("SampleDt", sampleDt);
+        node.get_parameter("MIGHTYWeightT", mightyWeightT);
+        node.get_parameter("MIGHTYPosWeight", mightyPosWeight);
+        node.get_parameter("MIGHTYVelWeight", mightyVelWeight);
+        node.get_parameter("MIGHTYOmegaWeight", mightyOmegaWeight);
+        node.get_parameter("MIGHTYThetaWeight", mightyThetaWeight);
+        node.get_parameter("MIGHTYThrustWeight", mightyThrustWeight);
         node.get_parameter("MIGHTYJerkWeight", mightyJerkWeight);
         node.get_parameter("CollisionDt", collisionDt);
         node.get_parameter("sfc_progress", sfc_progress);
         node.get_parameter("sfc_range", sfc_range);
+        node.get_parameter("do_benchmark", do_benchmark);
+
+        // Print out the configuration
+        std::cout << "=== Config ===" << std::endl;
+        std::cout << "Start: [" << startXYZ[0] << ", " << startXYZ[1] << ", " << startXYZ[2] << "]" << std::endl;
+        std::cout << "Goal:  [" << goalXYZ[0] << ", " << goalXYZ[1] << ", " << goalXYZ[2] << "]" << std::endl;
+        std::cout << "MaxVelMag:  " << maxVelMag << std::endl;
+        std::cout << "MIGHTYJerkWeight:  " << mightyJerkWeight << std::endl;
+        std::cout << "SampleDt:  " << sampleDt << std::endl;
+        std::cout << "CollisionDt:  " << collisionDt << std::endl;
+        if (exportCSVDir.size() > 0)
+        {
+#if __cplusplus >= 201703L
+            if (!fs::exists(exportCSVDir))
+            {
+                if (fs::create_directories(exportCSVDir))
+                    std::cout << "Created export directory: " << exportCSVDir << std::endl;
+                else
+                    std::cout << "Failed to create export directory: " << exportCSVDir << std::endl;
+            }
+#else
+            std::cout << "Export directory: " << exportCSVDir << " (creation check skipped, needs C++17)" << std::endl;
+#endif
+        }
+        std::cout << "===============" << std::endl;
     }
 };
 
@@ -397,8 +459,8 @@ toLinearConstraints(const std::vector<Eigen::MatrixX4d> &hPolys)
         Eigen::MatrixXd A(m, 3);
         Eigen::VectorXd b(m);
 
-        A = H.leftCols<3>();
-        b = -H.col(3); // just convention difference
+        A = -H.leftCols<3>();
+        b = H.col(3); // just convention difference
         out.emplace_back(A, b);
     }
     return out;
@@ -435,7 +497,7 @@ static void printCompare(const std::string &tagA, const Metrics &A,
     std::cout << std::left << std::setw(wName) << "metric"
               << std::right << std::setw(wNum) << tagA
               << std::right << std::setw(wNum) << tagB
-              << std::right << std::setw(wNum) << "Δ(B-A)\n";
+              << std::right << std::setw(wNum) << "Diff\n";
 
     pr("solve [ms]", A.solve_ms, B.solve_ms);
     pr("time [s]", A.time_s, B.time_s);
@@ -461,14 +523,16 @@ static MightyOut runMighty(
     const std::vector<LinearConstraint3D> &safe_corridor,
     const state &initial_state,
     const state &final_state,
-    const planner_params_t &params)
+    const planner_params_t &params,
+    const Config &cfg,
+    const Eigen::VectorXd &physical_params)
 {
     MightyOut out;
     using Clock = std::chrono::high_resolution_clock;
 
     // 2) Build solver; prepare problem
     auto solver = std::make_shared<SolverLBFGS>();
-    solver->initializeSolver(params); // immutable settings (weights, limits, etc) :contentReference[oaicite:2]{index=2}
+    solver->initializeSolver(params, physical_params); // immutable settings (weights, limits, etc) :contentReference[oaicite:2]{index=2}
 
     std::vector<std::shared_ptr<dynTraj>> obstacles; // none for now
 
@@ -488,16 +552,17 @@ static MightyOut runMighty(
 
     // 3) Optimize
     lbfgs::lbfgs_parameter_t lb;
-    lb.mem_size = (int)z0.size();
-    lb.past = 20;
-    lb.max_linesearch = 64;
-    lb.max_iterations = 300;
-    lb.delta = 1e-6;
-    lb.g_epsilon = 1e-6;
+    // lb.mem_size = (int)z0.size();
+    lb.mem_size = 256;
+    lb.past = 3;
+    lb.min_step = 1.0e-32;
+    lb.max_iterations = 100;
+    lb.g_epsilon = 1e-5;        // gradient tolerance
+    lb.delta = cfg.relCostTol; // relative cost tolerance
 
-    auto t_start = Clock::now();
     Eigen::VectorXd zopt;
     double fopt = 0.0;
+    auto t_start = Clock::now();
     solver->optimize(z0, zopt, fopt, lb); // LBFGS entrypoint (objective+analytic grad) :contentReference[oaicite:4]{index=4}
     auto t_end = Clock::now();
 
@@ -531,7 +596,8 @@ private:
     Config config;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr mapSub;
     Visualizer visualizer;
-    voxel_map::VoxelMap voxelMap;
+    voxel_map::VoxelMap voxelMapInfl_; // used for RRT/SFC/visualization
+    voxel_map::VoxelMap voxelMapRaw_;  // pre-dilation occupancy, used for collision metrics
 
     std::vector<Eigen::Vector3d> startGoal;
     Trajectory<5> traj;
@@ -543,6 +609,7 @@ private:
     std::vector<Eigen::Vector3d> routeCache_;
     std::vector<Eigen::MatrixX4d> hPolysCache_;
     rclcpp::TimerBase::SharedPtr repubTimer_;
+    rclcpp::TimerBase::SharedPtr exit_timer_;
     MightyOut M_mighty_;
 
     vec_E<Polyhedron<3>> poly_whole_;
@@ -566,11 +633,20 @@ public:
             static_cast<int>((config.mapBound[5] - config.mapBound[4]) / config.voxelWidth));
         Eigen::Vector3d offset(config.mapBound[0], config.mapBound[2], config.mapBound[4]);
 
-        voxelMap = voxel_map::VoxelMap(xyz, offset, config.voxelWidth);
+        voxelMapInfl_ = voxel_map::VoxelMap(xyz, offset, config.voxelWidth);
+        voxelMapRaw_ = voxel_map::VoxelMap(xyz, offset, config.voxelWidth);
 
         mapSub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             config.mapTopic, rclcpp::SensorDataQoS(),
             std::bind(&GlobalPlanner::mapCallBack, this, std::placeholders::_1));
+
+        // Keep RViz markers alive
+        if (!config.do_benchmark)
+        {
+            repubTimer_ = this->create_wall_timer(
+                std::chrono::milliseconds(100),
+                std::bind(&GlobalPlanner::republishMarkers_, this));
+        }
 
         // Keep RViz markers alive
         repubTimer_ = this->create_wall_timer(
@@ -582,6 +658,8 @@ public:
         RCLCPP_INFO(this->get_logger(), "minco_bench_viz ready. Waiting for map on %s",
                     config.mapTopic.c_str());
     }
+
+    bool getDoBenchmark() const { return config.do_benchmark; }
 
     void mapCallBack(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
@@ -598,9 +676,13 @@ public:
                 const float y = fdata[cur + 1];
                 const float z = fdata[cur + 2];
                 if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z))
-                    voxelMap.setOccupied(Eigen::Vector3d(x, y, z));
+                {
+                    Eigen::Vector3d p(x, y, z);
+                    voxelMapRaw_.setOccupied(p);
+                    voxelMapInfl_.setOccupied(p);
+                }
             }
-            voxelMap.dilate(std::ceil(config.dilateRadius / voxelMap.getScale()));
+            voxelMapInfl_.dilate(std::ceil(config.dilateRadius / voxelMapInfl_.getScale()));
             mapInitialized = true;
             RCLCPP_INFO(this->get_logger(), "Map ingested (%zu pts) & dilated.", total);
         }
@@ -627,12 +709,12 @@ public:
             Eigen::Vector3d start(S[0], S[1], S[2]);
             Eigen::Vector3d goal(G[0], G[1], G[2]);
 
-            if (voxelMap.query(start) != 0)
+            if (voxelMapInfl_.query(start) != 0)
             {
                 RCLCPP_WARN(this->get_logger(), "Start occupied; nudging up by DilateRadius.");
                 start.z() = clamp(start.z() + config.dilateRadius, config.mapBound[4], config.mapBound[5]);
             }
-            if (voxelMap.query(goal) != 0)
+            if (voxelMapInfl_.query(goal) != 0)
             {
                 RCLCPP_WARN(this->get_logger(), "Goal occupied; nudging up by DilateRadius.");
                 goal.z() = clamp(goal.z() + config.dilateRadius, config.mapBound[4], config.mapBound[5]);
@@ -647,6 +729,8 @@ public:
             visualizer.visualizeStartGoal(goal, 0.5, 1);
 
             plan(); // run both planners
+
+            scheduleExitIfBenchmark_();
         }
     }
 
@@ -659,8 +743,8 @@ public:
         std::vector<Eigen::Vector3d> route;
         sfc_gen::planPath<voxel_map::VoxelMap>(
             startGoal[0], startGoal[1],
-            voxelMap.getOrigin(), voxelMap.getCorner(),
-            &voxelMap, config.timeoutRRT, route);
+            voxelMapInfl_.getOrigin(), voxelMapInfl_.getCorner(),
+            &voxelMapInfl_, config.timeoutRRT, route);
 
         if (route.size() <= 1)
         {
@@ -670,8 +754,8 @@ public:
 
         std::vector<Eigen::MatrixX4d> hPolys;
         std::vector<Eigen::Vector3d> pc;
-        voxelMap.getSurf(pc);
-        sfc_gen::convexCover(route, pc, voxelMap.getOrigin(), voxelMap.getCorner(), config.sfc_progress, config.sfc_range, hPolys);
+        voxelMapInfl_.getSurf(pc);
+        sfc_gen::convexCover(route, pc, voxelMapInfl_.getOrigin(), voxelMapInfl_.getCorner(), config.sfc_progress, config.sfc_range, hPolys);
 
         sfc_gen::shortCut(hPolys);
         printf("Route size: %zu\n and hPolys size: %zu\n", route.size(), hPolys.size());
@@ -703,15 +787,12 @@ public:
             return;
         }
 
-        using Clock = std::chrono::high_resolution_clock;
-        auto gc_start = Clock::now();
         if (std::isinf(gcopter.optimize(traj, config.relCostTol)))
         {
             RCLCPP_ERROR(this->get_logger(), "GCOPTER optimize failed.");
             return;
         }
-        auto gc_end = Clock::now();
-        double gc_ms = std::chrono::duration_cast<std::chrono::microseconds>(gc_end - gc_start).count() * 1e-3;
+        double gc_ms = gcopter.getComputationTime();
 
         if (traj.getPieceNum() > 0)
         {
@@ -725,7 +806,7 @@ public:
         // === 3) Metrics for GCOPTER
         Metrics M_gc = computeMetricsGCOPTER_sampled_dt(traj, config.sampleDt);
         M_gc.solve_ms = gc_ms;
-        M_gc.n_collisions = countCollisionsGCOPTER(traj, voxelMap, config.collisionDt);
+        M_gc.n_collisions = countCollisionsGCOPTER(traj, voxelMapRaw_, config.collisionDt);
 
         // Get GCOPTER's initial guess for MIGHTY
         Eigen::Matrix3Xd init_points;
@@ -738,20 +819,23 @@ public:
         // === 4) Build MIGHTY params mapped from config
         planner_params_t mighty_cfg{};
         mighty_cfg.verbose = false;
-        mighty_cfg.V_nom = magnitudeBounds[0];
-        mighty_cfg.V_max = magnitudeBounds[0];
+        mighty_cfg.V_nom = config.maxVelMag;
+        mighty_cfg.V_max = config.maxVelMag;
         mighty_cfg.A_max = 0.0;                           // not used here
         mighty_cfg.J_max = 0.0;                           // not used here
-        mighty_cfg.time_weight = config.weightT;          // you can tune this
+        mighty_cfg.time_weight = config.mightyWeightT;          // you can tune this
         mighty_cfg.dyn_weight = 0.0;                      // no moving obstacles in this bench
-        mighty_cfg.stat_weight = config.chiVec[0];        // keep corridor penalties active
+        mighty_cfg.stat_weight = config.mightyPosWeight; // w_stat_pos
         mighty_cfg.jerk_weight = config.mightyJerkWeight; // you can tune this
-        mighty_cfg.dyn_constr_vel_weight = config.chiVec[1];
-        mighty_cfg.dyn_constr_acc_weight = 0.0; // not used here
-        mighty_cfg.omega_weight = config.chiVec[2];
-        mighty_cfg.theta_weight = config.chiVec[3];
-        mighty_cfg.thrust_min_weight = config.chiVec[4];
-        mighty_cfg.thrust_max_weight = config.chiVec[4];
+        mighty_cfg.dyn_constr_vel_weight = config.mightyVelWeight; // w_dyn_constr_vel
+        mighty_cfg.dyn_constr_bodyrate_weight = config.mightyOmegaWeight; // w_dyn_constr_bodyrate
+        mighty_cfg.dyn_constr_tilt_weight = config.mightyThetaWeight; // w_dyn_constr_tilt
+        mighty_cfg.dyn_constr_thrust_weight = config.mightyThrustWeight; // w_dyn_constr_thrust
+        mighty_cfg.orient_smooth_weight = config.orientSmoothWeight; // w_orient_smooth
+        mighty_cfg.tilt_bias_weight = config.tiltBiasWeight; // w_tilt_bias
+        mighty_cfg.tvar_weight = config.tvarWeight; // w_tvar
+        mighty_cfg.Tmin_weight = config.TminWeight; // w_Tmin
+        mighty_cfg.Tmin_plan = config.TminPlan; // Tmin for planning
         mighty_cfg.num_dyn_obst_samples = 64;
         mighty_cfg.init_turn_bf = 40.0; // degrees
         mighty_cfg.Co = 0.05;           // corridor “soft margin”
@@ -759,6 +843,14 @@ public:
         mighty_cfg.BIG = 1e9;
         mighty_cfg.dc = 0.01; // sampling step for setpoints
         mighty_cfg.second_to_last_vel_scale = 1.0;
+        mighty_cfg.integral_resolution = config.integralIntervs;
+        mighty_cfg.hinge_mu = config.smoothingEps;
+        mighty_cfg.omega_max = config.maxBdrMag;
+        mighty_cfg.tilt_max_rad = config.maxTiltAngle;
+        mighty_cfg.f_min = config.minThrust;
+        mighty_cfg.f_max = config.maxThrust;  // max thrust in N
+        mighty_cfg.mass = config.vehicleMass; // mass in kg
+        mighty_cfg.g = config.gravAcc;        // gravity in m/s^2
 
         // Prepare initial/goal states for MIGHTY (pos/vel/acc)
         state init_state, goal_state;
@@ -787,32 +879,9 @@ public:
             RCLCPP_WARN(this->get_logger(), "Some waypoints still near/outside corridor after projection.");
         }
 
-        // print out path_v for debugging
-        std::cout << "Path for MIGHTY:\n";
-        for (const auto &p : route_m)
-        {
-            std::cout << "  " << p.transpose() << "\n";
-        }
-
-        // Get obstacle points from the voxel map for the ROS2 decomp
-        // vec_Vecf<3> vec_o;
-        // voxelMap.getSurfaceObsForDecomp(vec_o);         // recommended
-        // or: voxelMap.getObsForDecomp(vec_o, /*surface_only=*/false, /*stride=*/2);
-
-        // Run your decomposer
-        // std::vector<LinearConstraint3D> l_constraints;
-        // bool ok = cvxEllipsoidDecomp(route_m, vec_o, l_constraints, poly_whole_);
-        // if (!ok) {
-        //     RCLCPP_WARN(get_logger(), "Ellipsoid decomposition failed");
-        // }
-
         // Convert GCOPTER’s hPolys to MIGHTY constraints
         std::vector<LinearConstraint3D> l_constraints = toLinearConstraints(hPolys);
-
-        printf("route_m size: %zu, l_constraints size: %zu\n",
-               route_m.size(), l_constraints.size());
-
-        MightyOut M_mighty = runMighty(route_m, l_constraints, init_state, goal_state, mighty_cfg);
+        MightyOut M_mighty = runMighty(route_m, l_constraints, init_state, goal_state, mighty_cfg, config, physicalParams);
 
         // Draw MIGHTY trajectory in green, with its own namespace
         visualizer.visualizeBezier(M_mighty.CP, M_mighty.T, /*ns=*/"mighty", /*width=*/0.06,
@@ -845,13 +914,24 @@ public:
         // === 6) Metrics for MIGHTY
         Metrics M_m = computeMetricsMIGHTY_sampled_dt(M_mighty.CP, M_mighty.T, /*dt=*/config.sampleDt);
         M_m.solve_ms = M_mighty.wall_ms;
-        M_m.n_collisions = countCollisionsMIGHTY(M_mighty.CP, M_mighty.T, voxelMap, config.collisionDt);
+        M_m.n_collisions = countCollisionsMIGHTY(M_mighty.CP, M_mighty.T, voxelMapRaw_, config.collisionDt);
 
         // === 7) Print comparison & wall times
         printCompare("GCOPTER", M_gc, "MIGHTY", M_m);
         std::cout << "GCOPTER solve time [ms]: (printed by library or external timer)\n";
         std::cout << "MIGHTY  solve time [ms]: " << M_mighty.wall_ms << "\n";
         std::cout << "MIGHTY  final objective : " << M_mighty.obj << "\n";
+
+        if (!config.exportCSVDir.empty())
+        {
+            const std::string csv =
+                (config.exportCSVDir.back() == '/' ? config.exportCSVDir
+                                                   : config.exportCSVDir + "/") +
+                "bench_stats.csv";
+
+            // start and goal are already available in plan() as Eigen::Vector3d start, goal
+            appendStatsCSV(csv, config, startGoal.front(), startGoal.back(), M_gc, M_m);
+        }
 
         M_mighty_ = M_mighty;
 
@@ -862,9 +942,18 @@ public:
             const std::string dir = config.exportCSVDir;
             const std::string f_gc = (dir.back() == '/' ? dir : dir + "/") + "gcopter_vaj.csv";
             const std::string f_my = (dir.back() == '/' ? dir : dir + "/") + "mighty_vaj.csv";
-            writeCSV_GCOPTER(traj, f_gc, config.sampleDt);
-            writeCSV_MIGHTY(M_mighty.CP, M_mighty.T, f_my, config.sampleDt);
-            RCLCPP_INFO(this->get_logger(), "Exported VAJ CSVs:\n  %s\n  %s", f_gc.c_str(), f_my.c_str());
+
+            writeCSV_GCOPTER(
+                traj, f_gc, config.sampleDt,
+                config.vehicleMass, config.gravAcc,
+                config.horizDrag, config.vertDrag, config.parasDrag,
+                config.speedEps);
+
+            writeCSV_MIGHTY(
+                M_mighty.CP, M_mighty.T, f_my, config.sampleDt,
+                config.vehicleMass, config.gravAcc,
+                config.horizDrag, config.vertDrag, config.parasDrag,
+                config.speedEps);
         }
     }
 
@@ -957,102 +1046,121 @@ public:
             visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, "mighty", 0.06, 120, 0.f, 1.f, 0.f, 1.f, "odom");
     }
 
+    void scheduleExitIfBenchmark_()
+    {
+        if (!config.do_benchmark)
+            return;
+        // Small delay to let markers & CSV writes flush
+        exit_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(250),
+            [this]()
+            {
+                RCLCPP_INFO(this->get_logger(), "[bench] one-shot mode: exiting node");
+                rclcpp::shutdown();
+            });
+    }
+
     void process()
     {
+
         if (traj.getPieceNum() <= 0)
             return;
 
-        double delta = this->now().seconds() - trajStamp;
-        if (!(delta < 0.0 || delta > traj.getTotalDuration()))
+        if (!config.do_benchmark)
         {
-            double thr;
-            Eigen::Vector4d quat;
-            Eigen::Vector3d omg;
 
-            Eigen::VectorXd physicalParams(6);
-            physicalParams << config.vehicleMass, config.gravAcc, config.horizDrag,
-                config.vertDrag, config.parasDrag, config.speedEps;
-
-            flatness::FlatnessMap flatmap;
-            flatmap.reset(physicalParams(0), physicalParams(1), physicalParams(2),
-                          physicalParams(3), physicalParams(4), physicalParams(5));
-
-            flatmap.forward(traj.getVel(delta), traj.getAcc(delta), traj.getJer(delta),
-                            0.0, 0.0, thr, quat, omg);
-
-            // Current pose & velocity
-            Eigen::Vector3d pos = traj.getPos(delta);
-            Eigen::Vector3d vel = traj.getVel(delta);
-            double speed = vel.norm();
-            double bodyratemag = omg.norm();
-            double tiltangle = std::acos(1.0 - 2.0 * (quat(1) * quat(1) + quat(2) * quat(2)));
-
-            std_msgs::msg::Float64 speedMsg, thrMsg, tiltMsg, bdrMsg;
-            speedMsg.data = speed;
-            thrMsg.data = thr;
-            tiltMsg.data = tiltangle;
-            bdrMsg.data = bodyratemag;
-
-            visualizer.speedPub->publish(speedMsg);
-            visualizer.thrPub->publish(thrMsg);
-            visualizer.tiltPub->publish(tiltMsg);
-            visualizer.bdrPub->publish(bdrMsg);
-
-            visualizer.visualizeSphere(pos, config.dilateRadius);
-
-            // Print speed next to it (two decimals)
+            double delta = this->now().seconds() - trajStamp;
+            if (!(delta < 0.0 || delta > traj.getTotalDuration()))
             {
-                std::ostringstream ss;
-                ss << std::fixed << std::setprecision(2) << speed << " m/s";
-                visualizer.visualizeText(pos, ss.str(),
-                                         /*scale_z=*/2.0,
-                                         /*r=*/0.f, /*g=*/0.f, /*b=*/0.f, /*a=*/1.f,
-                                         /*frame_id=*/"odom",
-                                         /*ns=*/"speed_text",
-                                         /*id=*/0,
-                                         /*ttl_sec=*/0.15,
-                                         /*planner=*/"gcopter");
+                double thr;
+                Eigen::Vector4d quat;
+                Eigen::Vector3d omg;
+
+                Eigen::VectorXd physicalParams(6);
+                physicalParams << config.vehicleMass, config.gravAcc, config.horizDrag,
+                    config.vertDrag, config.parasDrag, config.speedEps;
+
+                flatness::FlatnessMap flatmap;
+                flatmap.reset(physicalParams(0), physicalParams(1), physicalParams(2),
+                              physicalParams(3), physicalParams(4), physicalParams(5));
+
+                flatmap.forward(traj.getVel(delta), traj.getAcc(delta), traj.getJer(delta),
+                                0.0, 0.0, thr, quat, omg);
+
+                // Current pose & velocity
+                Eigen::Vector3d pos = traj.getPos(delta);
+                Eigen::Vector3d vel = traj.getVel(delta);
+                double speed = vel.norm();
+                double bodyratemag = omg.norm();
+                double tiltangle = std::acos(1.0 - 2.0 * (quat(1) * quat(1) + quat(2) * quat(2)));
+
+                std_msgs::msg::Float64 speedMsg, thrMsg, tiltMsg, bdrMsg;
+                speedMsg.data = speed;
+                thrMsg.data = thr;
+                tiltMsg.data = tiltangle;
+                bdrMsg.data = bodyratemag;
+
+                visualizer.speedPub->publish(speedMsg);
+                visualizer.thrPub->publish(thrMsg);
+                visualizer.tiltPub->publish(tiltMsg);
+                visualizer.bdrPub->publish(bdrMsg);
+
+                visualizer.visualizeSphere(pos, config.dilateRadius);
+
+                // Print speed next to it (two decimals)
+                {
+                    std::ostringstream ss;
+                    ss << std::fixed << std::setprecision(2) << speed << " m/s";
+                    visualizer.visualizeText(pos, ss.str(),
+                                             /*scale_z=*/2.0,
+                                             /*r=*/0.f, /*g=*/0.f, /*b=*/0.f, /*a=*/1.f,
+                                             /*frame_id=*/"odom",
+                                             /*ns=*/"speed_text",
+                                             /*id=*/0,
+                                             /*ttl_sec=*/0.15,
+                                             /*planner=*/"gcopter");
+                }
             }
-        }
 
-        if (!M_mighty_.CP.empty() && !M_mighty_.T.empty())
-        {
-            const double now_s = this->now().seconds();
-            const double Ttot_m = mightyEdges_.empty() ? std::accumulate(M_mighty_.T.begin(), M_mighty_.T.end(), 0.0)
-                                                       : mightyEdges_.back();
-            const double delta_m = now_s - mightyStamp_;
-            if (delta_m >= 0.0 && delta_m <= Ttot_m)
+            if (!M_mighty_.CP.empty() && !M_mighty_.T.empty())
             {
-                // locate segment
-                auto it = std::upper_bound(mightyEdges_.begin(), mightyEdges_.end(), delta_m);
-                int idx = static_cast<int>(std::distance(mightyEdges_.begin(), it)) - 1;
-                int s = std::clamp(idx, 0, (int)M_mighty_.CP.size() - 1);
+                const double now_s = this->now().seconds();
+                const double Ttot_m = mightyEdges_.empty() ? std::accumulate(M_mighty_.T.begin(), M_mighty_.T.end(), 0.0)
+                                                           : mightyEdges_.back();
+                const double delta_m = now_s - mightyStamp_;
+                if (delta_m >= 0.0 && delta_m <= Ttot_m)
+                {
+                    // locate segment
+                    auto it = std::upper_bound(mightyEdges_.begin(), mightyEdges_.end(), delta_m);
+                    int idx = static_cast<int>(std::distance(mightyEdges_.begin(), it)) - 1;
+                    int s = std::clamp(idx, 0, (int)M_mighty_.CP.size() - 1);
 
-                const double Ts = std::max(1e-9, M_mighty_.T[s]);
-                const double u = std::clamp((delta_m - mightyEdges_[s]) / Ts, 0.0, 1.0);
+                    const double Ts = std::max(1e-9, M_mighty_.T[s]);
+                    const double u = std::clamp((delta_m - mightyEdges_[s]) / Ts, 0.0, 1.0);
 
-                Eigen::Vector3d p, v, a, j;
-                evalBezier5_PVAJ(M_mighty_.CP[s], Ts, u, p, v, a, j);
+                    Eigen::Vector3d p, v, a, j;
+                    evalBezier5_PVAJ(M_mighty_.CP[s], Ts, u, p, v, a, j);
 
-                // Current position sphere (green)
-                visualizer.visualizeSphereColor(p, /*radius=*/config.dilateRadius,
-                                                /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
-                                                /*frame=*/"odom",
-                                                /*ns=*/"mighty_curr",
-                                                /*id=*/0,
-                                                /*ttl=*/0.15);
+                    // Current position sphere (green)
+                    visualizer.visualizeSphereColor(p, /*radius=*/config.dilateRadius,
+                                                    /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
+                                                    /*frame=*/"odom",
+                                                    /*ns=*/"mighty_curr",
+                                                    /*id=*/0,
+                                                    /*ttl=*/0.15);
 
-                // Velocity text just above the sphere
-                std::ostringstream ss;
-                ss << std::fixed << std::setprecision(2) << v.norm() << " m/s";
-                visualizer.visualizeText(p + Eigen::Vector3d(0, 0, 0.15), ss.str(),
-                                         /*scale_z=*/2.0,
-                                         /*r=*/0.f, /*g=*/0.6f, /*b=*/0.f, /*a=*/1.f,
-                                         /*frame_id=*/"odom",
-                                         /*ns=*/"mighty_speed",
-                                         /*id=*/0,
-                                         /*ttl_sec=*/0.15,
-                                         /*planner=*/"mighty");
+                    // Velocity text just above the sphere
+                    std::ostringstream ss;
+                    ss << std::fixed << std::setprecision(2) << v.norm() << " m/s";
+                    visualizer.visualizeText(p + Eigen::Vector3d(0, 0, 0.15), ss.str(),
+                                             /*scale_z=*/2.0,
+                                             /*r=*/0.f, /*g=*/0.6f, /*b=*/0.f, /*a=*/1.f,
+                                             /*frame_id=*/"odom",
+                                             /*ns=*/"mighty_speed",
+                                             /*id=*/0,
+                                             /*ttl_sec=*/0.15,
+                                             /*planner=*/"mighty");
+                }
             }
         }
 
@@ -1064,21 +1172,6 @@ public:
         visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, /*ns=*/"mighty", /*width=*/0.06,
                                    /*samples=*/120, /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
                                    /*frame_id=*/"odom");
-
-        if (poly_whole_.empty())
-        {
-            return;
-        }
-
-        // For whole trajectory
-        if (!poly_whole_.empty())
-        {
-            decomp_ros_msgs::msg::PolyhedronArray poly_whole_msg = DecompROS::polyhedron_array_to_ros(poly_whole_);
-            poly_whole_msg.header.stamp = this->now();
-            poly_whole_msg.header.frame_id = "odom";
-            poly_whole_msg.lifetime = rclcpp::Duration::from_seconds(1.0);
-            pub_poly_whole_->publish(poly_whole_msg);
-        }
     }
 
     // Check & fix interior waypoints against segment corridors (H rows: [nx ny nz d], inside if n·x + d <= 0).
@@ -1243,16 +1336,17 @@ public:
         j = 60.0 * invT3 * (e0 * D3[0] + e1 * D3[1] + e2 * D3[2]);
     }
 
-    // GCOPTER: sample [0, T_tot] every dt and write CSV
+    // GCOPTER: sample [0, T_tot] every dt and write CSV (now with ω, tilt, thrust)
     static void writeCSV_GCOPTER(const Trajectory<5> &traj,
                                  const std::string &filepath,
-                                 double dt)
+                                 double dt,
+                                 double mass, double grav,
+                                 double horizDrag, double vertDrag, double parasDrag,
+                                 double speedEps)
     {
 #if __cplusplus >= 201703L
         if (!filepath.empty())
-        {
             fs::create_directories(fs::path(filepath).parent_path());
-        }
 #endif
         std::ofstream f(filepath);
         if (!f.is_open())
@@ -1260,7 +1354,14 @@ public:
             std::cerr << "Failed to open " << filepath << "\n";
             return;
         }
-        f << "t,px,py,pz,vx,vy,vz,v_norm,ax,ay,az,a_norm,jx,jy,jz,j_norm\n";
+
+        f << "t,"
+          << "px,py,pz,"
+          << "vx,vy,vz,v_norm,"
+          << "ax,ay,az,a_norm,"
+          << "jx,jy,jz,j_norm,"
+          << "wx,wy,wz,omega_norm,"
+          << "thrust,b3z,tilt,tilt_deg\n";
 
         const double Ttot = traj.getTotalDuration();
         if (Ttot <= 0.0)
@@ -1269,35 +1370,61 @@ public:
             return;
         }
 
+        flatness::FlatnessMap flatmap;
+        flatmap.reset(mass, grav, horizDrag, vertDrag, parasDrag, speedEps);
+
         const int N = std::max(1, (int)std::ceil(Ttot / dt));
         for (int i = 0; i <= N; ++i)
         {
             double t = std::min(Ttot, i * dt);
+
+            // kinematics
             Eigen::Vector3d p = traj.getPos(t);
             Eigen::Vector3d v = traj.getVel(t);
             Eigen::Vector3d a = traj.getAcc(t);
             Eigen::Vector3d j = traj.getJer(t);
+
+            // flatness → thrust, attitude, body rates
+            double thr = 0.0;
+            Eigen::Vector4d quat; // [w, x, y, z]
+            Eigen::Vector3d omg;  // [wx, wy, wz]
+            flatmap.forward(v, a, j, /*yaw=*/0.0, /*yawdot=*/0.0, thr, quat, omg);
+
+            // body z in world (3rd column of R(q))
+            const double w = quat(0), x = quat(1), y = quat(2), z = quat(3);
+            const double b3x = 2.0 * (x * z + y * w);
+            const double b3y = 2.0 * (y * z - x * w);
+            const double b3z = 1.0 - 2.0 * (x * x + y * y);
+
+            // tilt angle (rad/deg)
+            const double bz_clamped = std::max(-1.0, std::min(1.0, b3z));
+            const double tilt = std::acos(bz_clamped);
+            const double tilt_deg = tilt * 180.0 / M_PI;
+
             f << std::fixed << std::setprecision(6)
               << t << ","
               << p.x() << "," << p.y() << "," << p.z() << ","
               << v.x() << "," << v.y() << "," << v.z() << "," << v.norm() << ","
               << a.x() << "," << a.y() << "," << a.z() << "," << a.norm() << ","
-              << j.x() << "," << j.y() << "," << j.z() << "," << j.norm() << "\n";
+              << j.x() << "," << j.y() << "," << j.z() << "," << j.norm() << ","
+              << omg.x() << "," << omg.y() << "," << omg.z() << "," << omg.norm() << ","
+              << thr << "," << b3z << "," << tilt << "," << tilt_deg << "\n";
         }
         f.close();
     }
 
-    // MIGHTY (Bezier CP/T): sample [0, sum(T)] every dt and write CSV
+    // MIGHTY (Bezier CP/T): sample [0, sum(T)] every dt and write CSV (now with ω, tilt, thrust)
     static void writeCSV_MIGHTY(const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
                                 const std::vector<double> &T,
                                 const std::string &filepath,
-                                double dt)
+                                double dt,
+                                double mass, double grav,
+                                double horizDrag, double vertDrag, double parasDrag,
+                                double speedEps)
     {
 #if __cplusplus >= 201703L
         if (!filepath.empty())
-        {
             fs::create_directories(fs::path(filepath).parent_path());
-        }
 #endif
         std::ofstream f(filepath);
         if (!f.is_open())
@@ -1305,7 +1432,14 @@ public:
             std::cerr << "Failed to open " << filepath << "\n";
             return;
         }
-        f << "t,px,py,pz,vx,vy,vz,v_norm,ax,ay,az,a_norm,jx,jy,jz,j_norm\n";
+
+        f << "t,"
+          << "px,py,pz,"
+          << "vx,vy,vz,v_norm,"
+          << "ax,ay,az,a_norm,"
+          << "jx,jy,jz,j_norm,"
+          << "wx,wy,wz,omega_norm,"
+          << "thrust,b3z,tilt,tilt_deg\n";
 
         const int M = (int)CP.size();
         if (M == 0)
@@ -1314,37 +1448,101 @@ public:
             return;
         }
 
-        // cumulative durations
+        // cumulative time edges
         std::vector<double> edges(M + 1, 0.0);
         for (int s = 0; s < M; ++s)
             edges[s + 1] = edges[s] + T[s];
         const double Ttot = edges.back();
         const int N = std::max(1, (int)std::ceil(Ttot / dt));
 
+        flatness::FlatnessMap flatmap;
+        flatmap.reset(mass, grav, horizDrag, vertDrag, parasDrag, speedEps);
+
         int seg = 0;
         for (int i = 0; i <= N; ++i)
         {
             double t = std::min(Ttot, i * dt);
-
-            // advance segment
             while (seg < M - 1 && t > edges[seg + 1])
                 ++seg;
 
-            const double Ts = T[seg];
+            const double Ts = std::max(1e-9, T[seg]);
             const double t0 = edges[seg];
-            const double u = (Ts <= 0.0) ? 0.0 : (t - t0) / Ts;
+            const double u = std::clamp((t - t0) / Ts, 0.0, 1.0);
 
             Eigen::Vector3d p, v, a, j;
-            evalBezier5_PVAJ(CP[seg], Ts, std::clamp(u, 0.0, 1.0), p, v, a, j);
+            evalBezier5_PVAJ(CP[seg], Ts, u, p, v, a, j);
+
+            double thr = 0.0;
+            Eigen::Vector4d quat;
+            Eigen::Vector3d omg;
+            flatmap.forward(v, a, j, /*yaw=*/0.0, /*yawdot=*/0.0, thr, quat, omg);
+
+            const double w = quat(0), x = quat(1), y = quat(2), z = quat(3);
+            const double b3x = 2.0 * (x * z + y * w);
+            const double b3y = 2.0 * (y * z - x * w);
+            const double b3z = 1.0 - 2.0 * (x * x + y * y);
+
+            const double bz_clamped = std::max(-1.0, std::min(1.0, b3z));
+            const double tilt = std::acos(bz_clamped);
+            const double tilt_deg = tilt * 180.0 / M_PI;
 
             f << std::fixed << std::setprecision(6)
               << t << ","
               << p.x() << "," << p.y() << "," << p.z() << ","
               << v.x() << "," << v.y() << "," << v.z() << "," << v.norm() << ","
               << a.x() << "," << a.y() << "," << a.z() << "," << a.norm() << ","
-              << j.x() << "," << j.y() << "," << j.z() << "," << j.norm() << "\n";
+              << j.x() << "," << j.y() << "," << j.z() << "," << j.norm() << ","
+              << omg.x() << "," << omg.y() << "," << omg.z() << "," << omg.norm() << ","
+              << thr << "," << b3z << "," << tilt << "," << tilt_deg << "\n";
         }
         f.close();
+    }
+
+    // Append one row of benchmark stats to CSV (creates file + header on first use)
+    static void appendStatsCSV(const std::string &filepath,
+                               const Config &cfg,
+                               const Eigen::Vector3d &start,
+                               const Eigen::Vector3d &goal,
+                               const Metrics &G, // GCOPTER
+                               const Metrics &M) // MIGHTY
+    {
+#if __cplusplus >= 201703L
+        if (!filepath.empty())
+            fs::create_directories(fs::path(filepath).parent_path());
+        const bool need_header = !fs::exists(filepath) || fs::file_size(filepath) == 0;
+#else
+        const bool need_header = true; // fallback (header may repeat if not C++17)
+#endif
+
+        std::ofstream f(filepath, std::ios::app);
+        if (!f.is_open())
+        {
+            std::cerr << "[appendStatsCSV] Failed to open " << filepath << "\n";
+            return;
+        }
+
+        if (need_header)
+        {
+            f << "stamp,start_x,start_y,start_z,goal_x,goal_y,goal_z,"
+                 "max_vel,jerk_weight,sfc_progress,sfc_range,sample_dt,collision_dt,"
+                 "gc_solve_ms,gc_time_s,gc_path_len,gc_jerk_cost,gc_collisions,"
+                 "my_solve_ms,my_time_s,my_path_len,my_jerk_cost,my_collisions\n";
+        }
+
+        const double stamp = std::chrono::duration<double>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count();
+
+        f << std::fixed << std::setprecision(6)
+          << stamp << ","
+          << start.x() << "," << start.y() << "," << start.z() << ","
+          << goal.x() << "," << goal.y() << "," << goal.z() << ","
+          << cfg.maxVelMag << "," << cfg.mightyJerkWeight << ","
+          << cfg.sfc_progress << "," << cfg.sfc_range << ","
+          << cfg.sampleDt << "," << cfg.collisionDt << ","
+          << G.solve_ms << "," << G.time_s << "," << G.path_len << "," << G.jerk_cost << "," << G.n_collisions << ","
+          << M.solve_ms << "," << M.time_s << "," << M.path_len << "," << M.jerk_cost << "," << M.n_collisions
+          << "\n";
     }
 };
 
@@ -1353,6 +1551,15 @@ int main(int argc, char **argv)
     rclcpp::init(argc, argv);
     auto node = std::make_shared<GlobalPlanner>();
 
+    bool do_benchmark = node->getDoBenchmark();
+
+    if (do_benchmark)
+    {
+        rclcpp::spin(node); // <- node exits itself in bench mode
+        rclcpp::shutdown();
+        return 0;
+    }
+
     rclcpp::Rate rate(1000);
     while (rclcpp::ok())
     {
@@ -1360,6 +1567,7 @@ int main(int argc, char **argv)
         rclcpp::spin_some(node);
         rate.sleep();
     }
+
     rclcpp::shutdown();
     return 0;
 }

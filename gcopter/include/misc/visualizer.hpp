@@ -294,7 +294,7 @@ public:
         double width = 0.06,
         int samples_per_seg = 120,
         float r = 0.0f, float g = 1.0f, float b = 0.0f, float a = 1.0f,
-        const std::string &frame_id = "world" // set to your RViz fixed frame if different
+        const std::string &frame_id = "odom" // set to your RViz fixed frame if different
     )
     {
 

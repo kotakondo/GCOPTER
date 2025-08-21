@@ -11,14 +11,23 @@ def generate_launch_description():
     rviz_config_path = PathJoinSubstitution(
         [FindPackageShare('gcopter'), 'config', 'global_planning.rviz']
     )
-    
-    gcopter_config_path = PathJoinSubstitution(
-        [FindPackageShare('gcopter'), 'config', 'global_planning.yaml']
-    )
+
+    use_simple_case_benchmark = LaunchConfiguration('use_simple_case_benchmark', default='false')
+
+    if use_simple_case_benchmark:
+        x_length = 20
+        y_length = 20
+        type = 3
+        fractal = 3
+        road_width = 5.0
+    else:
+        x_length = 50
+        y_length = 50
+        type = 1
+        fractal = 1
+        road_width = 0.0
 
     return LaunchDescription([
-        DeclareLaunchArgument('start', default_value='[0.0, 0.0, 0.5]'),
-        DeclareLaunchArgument('goal',  default_value='[10.0, 3.0, 1.5]'),
 
         # mockamap (as you had it)
         Node(
@@ -30,29 +39,17 @@ def generate_launch_description():
                 'seed': 1024,
                 'update_freq': 1.0,
                 'resolution': 0.25,
-                'x_length': 20,
-                'y_length': 20,
+                'x_length': x_length,
+                'y_length': y_length,
                 'z_length': 5,
-                'type': 3,
+                'type': type,
                 'complexity': 0.025,
                 'fill': 0.3,
-                'fractal': 3,
+                'fractal': fractal,
                 'attenuation': 0.1,
-                'road_width': 5.0,
+                'road_width': road_width,
             }],
             remappings=[('/mock_map', '/voxel_map')],
-        ),
-
-        Node(
-            package='gcopter',
-            executable='minco_bench_viz',   # whatever you named the above file
-            name='minco_bench_viz',
-            output='screen',
-            parameters=[gcopter_config_path,
-                        {'Start': LaunchConfiguration('start'),
-                         'Goal': LaunchConfiguration('goal'),
-                         'ExportCSVDir': '/home/kkondo/data/gcopter_csv'}],
-            # prefix='xterm -e gdb -q -ex run --args', # gdb debugging
         ),
 
         # optional: rviz2

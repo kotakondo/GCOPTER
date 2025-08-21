@@ -21,6 +21,7 @@
 #include <gcopter/lbfgs.hpp>
 #include <omp.h>
 #include <set>
+#include <gcopter/flatness.hpp>
 
 // ROS
 #include <dynus/dynus_type.hpp>
@@ -60,16 +61,16 @@ namespace lbfgs
         double dyn_weight = 1.0;
         double stat_weight = 1.0;
         double jerk_weight = 10.0;
+        double dyn_constr_bodyrate_weight = 10.0; // weight for body rate constraints
+        double dyn_constr_tilt_weight = 10.0;     // weight for tilt constraints
+        double dyn_constr_thrust_weight = 10.0;   // weight for
         double dyn_constr_vel_weight = 10.0;
         double dyn_constr_acc_weight = 10.0;
-        double theta_weight = 1.0;             // Weight for tilt angle constraints
-        double thrust_min_weight = 1.0;        // Weight for minimum thrust constraints
-        double thrust_max_weight = 1.0;        // Weight for maximum thrust constraints
-        double omega_weight = 1.0;             // Weight for angular velocity constraints
-        double omega_max = 20.0;                // Maximum angular velocity
-        double theta_max = 20.0;                // Maximum tilt angle
-        double thrust_min = 0.0;               // Minimum thrust
-        double thrust_max = 20.0;               // Maximum thrust
+        double orient_smooth_weight{0.0};      // w_orient
+        double tilt_bias_weight{0.0};          // w_tilt_bias
+        double tvar_weight{0.0};               // w_tvar
+        double Tmin_weight{0.0};               // w_Tmin
+        double Tmin_plan{0.0};                 // soft floor [s]
         int num_dyn_obst_samples = 10;         // Number of dynamic obstacle samples
         double Co = 0.5;                       // for static obstacle avoidance
         double Cw = 1.0;                       // for dynamic obstacle avoidance
@@ -77,6 +78,14 @@ namespace lbfgs
         double dc = 0.01;                      // descretiation constant
         double second_to_last_vel_scale = 0.9; // scale for the second to last velocity vector in the optimization
         double init_turn_bf = 15.0;            // initial turn buffer in degrees
+        int integral_resolution = 30;          // resolution for the integral in the optimization
+        double hinge_mu = 1e-2;                // hinge mu for the optimization
+        double omega_max = 1.0;                // max body rate in rad/s
+        double tilt_max_rad = 0.6;             // max tilt in radians (e.g., 35° in rad)
+        double f_min = 0.0;                    // min thrust in N
+        double f_max = 20.0;                   // max thrust in N
+        double mass = 1.0;                     // mass in kg
+        double g = 9.81;                       // gravity in m/s^2
     };
 
     class SolverLBFGS
@@ -133,7 +142,7 @@ namespace lbfgs
          * @param z  Decision vector [p₀,v₀,a₀ … p_M,v_M,a_M; σ₀…σ_{M-1}]
          * @return   Scalar value of the objective at z
          */
-        double evaluateObjective(const VecXd &z) const;
+        double evaluateObjective(const VecXd &z);
 
         // -----------------------------------------------------------------------------
 
@@ -144,7 +153,7 @@ namespace lbfgs
          */
         void computeAnalyticalGrad(
             const Eigen::VectorXd &z,
-            Eigen::VectorXd &grad) const;
+            Eigen::VectorXd &grad);
 
         // -----------------------------------------------------------------------------
 
@@ -156,7 +165,7 @@ namespace lbfgs
          * @return cost = J(z)
          */
         double evaluateObjectiveAndGradient(const Eigen::VectorXd &z,
-                                            Eigen::VectorXd &g) const;
+                                            Eigen::VectorXd &g);
 
         // -----------------------------------------------------------------------------
 
@@ -264,7 +273,7 @@ namespace lbfgs
         /**
          * @brief initialize the solver with default parameters.
          */
-        void initializeSolver(const planner_params_t &params);
+        void initializeSolver(const planner_params_t &params, const Eigen::VectorXd &physical_params);
 
         /**
          *
@@ -276,7 +285,7 @@ namespace lbfgs
                                     const state &initial_state,
                                     const state &goal_state,
                                     double &initial_guess_computation_time,
-                                    bool use_multiple_initial_guesses);
+                                    bool use_multiple_initial_guesses = true);
 
         /**
          * @brief Set the initial guess waypoints for the trajectory.
@@ -458,6 +467,9 @@ namespace lbfgs
          */
         void dJ_stat_dz(const VecXd &z,
                         const std::vector<Vec3> &P,
+                        const std::vector<Vec3> &V,
+                        const std::vector<Vec3> &A,
+                        const std::vector<std::array<Vec3, 6>> &CP,
                         const std::vector<double> &T,
                         VecXd &grad) const;
 
@@ -475,6 +487,16 @@ namespace lbfgs
                         const std::vector<std::array<Vec3, 6>> &CP,
                         const std::vector<double> &T,
                         VecXd &grad) const;
+
+        // -----------------------------------------------------------------------------
+
+        void dJ_limits_and_static_dz(const VecXd &z,
+                                     const std::vector<Vec3> &P,
+                                     const std::vector<Vec3> &V,
+                                     const std::vector<Vec3> &A,
+                                     const std::vector<std::array<Vec3, 6>> &CP,
+                                     const std::vector<double> &T,
+                                     VecXd &grad);
 
         // -----------------------------------------------------------------------------
 
@@ -610,47 +632,6 @@ namespace lbfgs
             return C[n][k];
         }
 
-        // -----------------------------------------------------------------------------
-        // GCOPTER-like MIGHTY functions
-        // -----------------------------------------------------------------------------
-
-        // Thrust upper bound:  ||a + g|| <= f_max/m   via accel CPs
-        void dJ_thrust_max_dz(const VecXd &z,
-                              const std::vector<Vec3> &P,
-                              const std::vector<Vec3> &V,
-                              const std::vector<Vec3> &A,
-                              const std::vector<std::array<Vec3, 6>> &CP,
-                              const std::vector<double> &T,
-                              VecXd &grad) const;
-
-        // Thrust lower bound (conservative z-component):  a_z + g >= f_min/m
-        void dJ_thrust_min_dz(const VecXd &z,
-                              const std::vector<Vec3> &P,
-                              const std::vector<Vec3> &V,
-                              const std::vector<Vec3> &A,
-                              const std::vector<std::array<Vec3, 6>> &CP,
-                              const std::vector<double> &T,
-                              VecXd &grad) const;
-
-        // Tilt (cone in accel space):  ||(a+g)_{xy}|| <= tan(theta_max) * (a+g)_z
-        void dJ_theta_dz(const VecXd &z,
-                         const std::vector<Vec3> &P,
-                         const std::vector<Vec3> &V,
-                         const std::vector<Vec3> &A,
-                         const std::vector<std::array<Vec3, 6>> &CP,
-                         const std::vector<double> &T,
-                         VecXd &grad) const;
-
-        // Body-rate bound (conservative jerk vs vertical thrust):
-        //   ||J|| <= omega_max * (a+g)_z, with J from Bézier 3rd differences
-        void dJ_omega_dz(const VecXd &z,
-                         const std::vector<Vec3> &P,
-                         const std::vector<Vec3> &V,
-                         const std::vector<Vec3> &A,
-                         const std::vector<std::array<Vec3, 6>> &CP,
-                         const std::vector<double> &T,
-                         VecXd &grad) const;
-
     protected:
         // ------------------------------
         // Parameters
@@ -692,6 +673,21 @@ namespace lbfgs
         int num_perturbation_;
         double r_max_;
 
+        // sampling & smoothing
+        int integral_resolution_ = 30;
+        double hinge_mu_ = 1e-2;
+
+        // vehicle/dynamics limits and constants
+        double omege_max_ = 6.0;                    // rad/s
+        double tilt_max_rad_ = M_PI * 35.0 / 180.0; // 35 deg
+        double f_min_ = 0.0;                        // N
+        double f_max_ = 20.0;                       // N
+        double mass_ = 1.0;                         // kg
+        double g_ = 9.81;                           // m/s^2
+
+        // parameters
+        flatness::FlatnessMap flatmap_;
+
         // Optimization weights and settings
         double time_weight_;
         double dyn_weight_;
@@ -699,25 +695,22 @@ namespace lbfgs
         double jerk_weight_;
         double dyn_constr_vel_weight_;
         double dyn_constr_acc_weight_;
+        double dyn_constr_bodyrate_weight_ = 1.0;
+        double dyn_constr_tilt_weight_ = 1.0;
+        double dyn_constr_thrust_weight_ = 1.0;
         int num_dyn_obst_samples_; // Number of dynamic obstacle samples
-        double Co_;                // for static obstacle avoidance
+        double orient_smooth_weight_{0.0};
+        double tilt_bias_weight_{0.0};
+        double tvar_weight_{0.0};
+        double Tmin_weight_{0.0};
+        double Tmin_plan_{0.0};
+        double Co_; // for static obstacle avoidance
         double Cw_;
         double second_to_last_vel_scale_;
         double V_min_;      // used for initial guess
         double turn_buf_;   // used for initial guess
         double turn_span_;  // used for initial guess
         double cos_thresh_; // used for initial guess
-
-        // GCOPTER-like MIGHTY parameters
-        double thrust_max_weight_ = 1.0;
-        double thrust_min_weight_ = 1.0;
-        double theta_weight_ = 1.0;
-        double omega_weight_ = 1.0;
-        double omega_max_ = 2.1;
-        double theta_max_ = 1.05;
-        double thrust_min_ = 2.0;
-        double thrust_max_ = 12.0;
-        double g_ = 9.81; // aligns with +e3 by default
 
         // Constants
         double Cw2_;

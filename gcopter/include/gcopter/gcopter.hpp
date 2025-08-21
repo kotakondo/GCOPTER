@@ -48,6 +48,7 @@ namespace gcopter
         typedef std::vector<PolyhedronH> PolyhedraH;
         Eigen::Matrix3Xd initial_guess_points_;
         Eigen::VectorXd initial_guess_times_;
+        double computation_time_ms_;
 
     private:
         minco::MINCO_S3NU minco;
@@ -825,12 +826,16 @@ namespace gcopter
             lbfgs_params.mem_size = 256;
             lbfgs_params.past = 3;
             lbfgs_params.min_step = 1.0e-32;
-            lbfgs_params.g_epsilon = 0.0;
+            lbfgs_params.max_iterations = 100;
+            lbfgs_params.g_epsilon = 1e-5;
             lbfgs_params.delta = relCostTol;
 
             // save initial guess
             initial_guess_points_ = points;
             initial_guess_times_ = times;
+
+            using Clock = std::chrono::high_resolution_clock;
+            auto start = Clock::now();
 
             int ret = lbfgs::lbfgs_optimize(x,
                                             minCostFunctional,
@@ -840,23 +845,31 @@ namespace gcopter
                                             this,
                                             lbfgs_params);
 
-            if (ret >= 0)
-            {
-                forwardT(tau, times);
-                forwardP(xi, vPolyIdx, vPolytopes, points);
-                minco.setParameters(points, times);
-                minco.getTrajectory(traj);
-            }
-            else
-            {
-                traj.clear();
-                minCostFunctional = INFINITY;
-                std::cout << "Optimization Failed: "
-                          << lbfgs::lbfgs_strerror(ret)
-                          << std::endl;
-            }
+            auto end = Clock::now();
+            computation_time_ms_ = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() * 1e-3;
+
+            // if (ret >= 0)
+            // {
+            forwardT(tau, times);
+            forwardP(xi, vPolyIdx, vPolytopes, points);
+            minco.setParameters(points, times);
+            minco.getTrajectory(traj);
+            // }
+            // else
+            // {
+            //     traj.clear();
+            //     minCostFunctional = INFINITY;
+            //     std::cout << "Optimization Failed: "
+            //               << lbfgs::lbfgs_strerror(ret)
+            //               << std::endl;
+            // }
 
             return minCostFunctional;
+        }
+
+        double getComputationTime() const
+        {
+            return computation_time_ms_;
         }
 
         void getInitialGuess(Eigen::Matrix3Xd &points,

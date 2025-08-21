@@ -11,6 +11,385 @@
 
 using namespace lbfgs;
 
+// H-polyhedron: rows are [n_x n_y n_z d] meaning n^T x <= d
+using PolyhedronH = Eigen::Matrix<double, Eigen::Dynamic, 4>;
+using PolyhedronV = Eigen::Matrix3Xd;
+using PolyhedraH = std::vector<PolyhedronH>;
+using PolyhedraV = std::vector<PolyhedronV>;
+
+// -----------------------------------------------------------------------------
+// Helper functions
+// -----------------------------------------------------------------------------
+
+// GCOPTER time map (matches your Python):
+//   τ >= 0 :  T(τ) = 0.5 τ^2 + τ + 1
+//   τ <  0 :  T(τ) = 1 / (0.5 τ^2 - τ + 1)
+// strictly positive and C1; T(0)=1, T'(0)=1.
+
+// GCOPTER τ→T and dT/dτ (exactly matches Python)
+inline double tau_to_T(double tau)
+{
+    if (tau >= 0.0)
+        return 0.5 * tau * tau + tau + 1.0;
+    const double den = 0.5 * tau * tau - tau + 1.0;
+    return 1.0 / den;
+}
+inline double dT_dtau(double tau)
+{
+    if (tau >= 0.0)
+        return tau + 1.0;
+    const double den = 0.5 * tau * tau - tau + 1.0;
+    return (1.0 - tau) / (den * den);
+}
+inline double T_to_tau(double T)
+{
+    if (T >= 1.0)
+    {
+        double x = std::max(2.0 * T - 1.0, 0.0);
+        return std::sqrt(x) - 1.0;
+    }
+    double x = std::max(2.0 / T - 1.0, 0.0);
+    return 1.0 - std::sqrt(x);
+}
+
+// Build per-knot T̄ = [ T0, 0.5(T0+T1), ..., 0.5(T_{M-2}+T_{M-1}), T_{M-1} ]
+inline void build_Tbar(const std::vector<double> &T, std::vector<double> &Tbar)
+{
+    const int M = (int)T.size();
+    Tbar.resize(M + 1);
+    Tbar[0] = T[0];
+    for (int i = 1; i < M; ++i)
+        Tbar[i] = 0.5 * (T[i - 1] + T[i]);
+    Tbar[M] = T[M - 1];
+}
+
+// Distribute gTbar[k] (knot derivatives) onto segment derivatives gTextra[s]:
+//   dTbar_0/dT0 = 1
+//   dTbar_i/dT_{i-1} = 1/2, dTbar_i/dT_i = 1/2  for i=1..M-1
+//   dTbar_M/dT_{M-1} = 1
+inline void distribute_gTbar_to_segments(const std::vector<double> &gTbar,
+                                         std::vector<double> &gTextra)
+{
+    const int M = (int)gTextra.size();
+    // safety: expect gTbar.size() == M+1
+    if ((int)gTbar.size() != M + 1)
+        return;
+    // clear
+    std::fill(gTextra.begin(), gTextra.end(), 0.0);
+    // endpoints
+    gTextra[0] += gTbar[0];
+    gTextra[M - 1] += gTbar[M];
+    // interiors
+    for (int i = 1; i < M; ++i)
+    {
+        const double v = 0.5 * gTbar[i];
+        gTextra[i - 1] += v; // from Tbar_i wrt T_{i-1}
+        gTextra[i] += v;     // from Tbar_i wrt T_i
+    }
+}
+
+// --- smoothed L1 (hinge with C1 smoothing) and its derivative ---
+// ϕ(x;μ) = 0                     if x ≤ 0
+//        = 0.5 x^2 / μ           if 0 < x < μ
+//        = x - 0.5 μ             if x ≥ μ
+inline double smoothed_l1(double x, double mu)
+{
+    if (x <= 0.0)
+        return 0.0;
+    if (x < mu)
+        return 0.5 * x * x / mu;
+    return x - 0.5 * mu;
+}
+
+inline double smoothed_l1_prime(double x, double mu)
+{
+    if (x <= 0.0)
+        return 0.0;
+    if (x < mu)
+        return x / mu;
+    return 1.0;
+}
+
+inline void bernstein5(double u, double B[6])
+{
+    const double um = 1.0 - u;
+    const double u2 = u * u, u3 = u2 * u, u4 = u3 * u, u5 = u4 * u;
+    const double m2 = um * um, m3 = m2 * um, m4 = m3 * um, m5 = m4 * um;
+    B[0] = m5;
+    B[1] = 5.0 * u * m4;
+    B[2] = 10.0 * u2 * m3;
+    B[3] = 10.0 * u3 * m2;
+    B[4] = 5.0 * u4 * um;
+    B[5] = u5;
+}
+
+inline void bernstein4(double u, double b[5])
+{
+    const double um = 1.0 - u;
+    const double u2 = u * u, u3 = u2 * u, u4 = u3 * u;
+    const double m2 = um * um, m3 = m2 * um, m4 = m3 * um;
+    b[0] = m4;
+    b[1] = 4.0 * u * m3;
+    b[2] = 6.0 * u2 * m2;
+    b[3] = 4.0 * u3 * um;
+    b[4] = u4;
+}
+
+// Cubic Bernstein basis B^3_k(s), k=0..3
+inline void bernstein3(double s, double B[4])
+{
+    // (optional) clamp for numeric safety
+    if (s < 0.0)
+        s = 0.0;
+    if (s > 1.0)
+        s = 1.0;
+
+    const double t = 1.0 - s;
+    const double t2 = t * t;
+    const double s2 = s * s;
+
+    B[0] = t * t2;       // (1 - s)^3
+    B[1] = 3.0 * s * t2; // 3 s (1 - s)^2
+    B[2] = 3.0 * s2 * t; // 3 s^2 (1 - s)
+    B[3] = s * s2;       // s^3
+}
+
+// Quadratic Bernstein basis B^2_k(s), k=0..2
+inline void bernstein2(double s, double B[3])
+{
+    // (optional) clamp for numeric safety
+    if (s < 0.0)
+        s = 0.0;
+    if (s > 1.0)
+        s = 1.0;
+
+    const double t = 1.0 - s;
+
+    B[0] = t * t;       // (1 - s)^2
+    B[1] = 2.0 * s * t; // 2 s (1 - s)
+    B[2] = s * s;       // s^2
+}
+
+// Enumerate vertices of H-polyhedron by all 3-plane intersections.
+inline bool enumerateVertices(const PolyhedronH &H, PolyhedronV &V, double tol = 1e-8)
+{
+    const int m = H.rows();
+    if (m < 4)
+        return false;
+
+    const Eigen::MatrixXd A = H.leftCols<3>();
+    const Eigen::VectorXd b = H.col(3);
+
+    std::vector<Eigen::Vector3d> verts;
+    verts.reserve(m * m);
+
+    for (int i = 0; i < m; ++i)
+        for (int j = i + 1; j < m; ++j)
+            for (int k = j + 1; k < m; ++k)
+            {
+                Eigen::Matrix3d A3;
+                A3.row(0) = A.row(i);
+                A3.row(1) = A.row(j);
+                A3.row(2) = A.row(k);
+                if (std::abs(A3.determinant()) < 1e-10)
+                    continue;
+
+                Eigen::Vector3d b3(b(i), b(j), b(k));
+                Eigen::Vector3d x = A3.colPivHouseholderQr().solve(b3);
+
+                // Feasibility: A x <= b (+tol)
+                if (((A * x).array() <= (b.array() + tol)).all())
+                {
+                    bool unique = true;
+                    for (auto &p : verts)
+                        if ((p - x).norm() < 1e-7)
+                        {
+                            unique = false;
+                            break;
+                        }
+                    if (unique)
+                        verts.push_back(x);
+                }
+            }
+
+    if (verts.size() < 4)
+        return false; // likely unbounded/degenerate
+    V.resize(3, (int)verts.size());
+    for (int i = 0; i < (int)verts.size(); ++i)
+        V.col(i) = verts[i];
+    return true;
+}
+
+// Convert a sequence of H-polytopes into V-representation lists:
+// vPs = [poly0, inter01, poly1, inter12, ..., polyN]
+inline bool processCorridor(const PolyhedraH &hPs, PolyhedraV &vPs)
+{
+    const int N = (int)hPs.size();
+    if (N == 0)
+        return false;
+
+    vPs.clear();
+    vPs.reserve(2 * N - 1);
+
+    PolyhedronV V, VI;
+    for (int i = 0; i < N - 1; ++i)
+    {
+        if (!enumerateVertices(hPs[i], V))
+            return false;
+        // OB form: col0 = origin, others = (vertex - origin)
+        PolyhedronV O;
+        O.resize(3, V.cols());
+        O.col(0) = V.col(0);
+        O.rightCols(V.cols() - 1) = V.rightCols(V.cols() - 1).colwise() - V.col(0);
+        vPs.push_back(O);
+
+        // Intersection of consecutive polytopes -> stack H rows then enumerate
+        PolyhedronH HI(hPs[i].rows() + hPs[i + 1].rows(), 4);
+        HI.topRows(hPs[i].rows()) = hPs[i];
+        HI.bottomRows(hPs[i + 1].rows()) = hPs[i + 1];
+        if (!enumerateVertices(HI, VI))
+            return false;
+        PolyhedronV OI;
+        OI.resize(3, VI.cols());
+        OI.col(0) = VI.col(0);
+        OI.rightCols(VI.cols() - 1) = VI.rightCols(VI.cols() - 1).colwise() - VI.col(0);
+        vPs.push_back(OI);
+    }
+    // last poly
+    if (!enumerateVertices(hPs.back(), V))
+        return false;
+    PolyhedronV O;
+    O.resize(3, V.cols());
+    O.col(0) = V.col(0);
+    O.rightCols(V.cols() - 1) = V.rightCols(V.cols() - 1).colwise() - V.col(0);
+    vPs.push_back(O);
+    return true;
+}
+
+// Shortest-path cost over intersection points (smoothed L2)
+inline double costDistance(void *ptr, const Eigen::VectorXd &xi, Eigen::VectorXd &gradXi)
+{
+    void **data = (void **)ptr;
+    const double &eps = *((const double *)(data[0]));
+    const Eigen::Vector3d &p0 = *((const Eigen::Vector3d *)(data[1]));
+    const Eigen::Vector3d &pf = *((const Eigen::Vector3d *)(data[2]));
+    const PolyhedraV &vPolys = *((PolyhedraV *)(data[3]));
+
+    const int overlaps = (int)vPolys.size() / 2; // # intersection polytopes
+    gradXi.setZero(xi.size());
+
+    Eigen::Matrix3Xd gradP = Eigen::Matrix3Xd::Zero(3, overlaps);
+    Eigen::Vector3d a, b, d;
+    double cost = 0.0;
+
+    // forward pass: accumulate smooth distances and waypoint grads
+    for (int i = 0, j = 0, k = 0; i <= overlaps; ++i, j += k)
+    {
+        a = (i == 0) ? p0 : b;
+        if (i < overlaps)
+        {
+            const auto &OB = vPolys[2 * i + 1]; // intersection poly in OB form
+            k = (int)OB.cols();
+            Eigen::Map<const Eigen::VectorXd> q(xi.data() + j, k);
+
+            // r are "square-root barycentric" weights; last dim is slack to enforce unit norm
+            Eigen::VectorXd r = q.normalized().head(k - 1);
+            b = OB.rightCols(k - 1) * r.cwiseProduct(r) + OB.col(0);
+        }
+        else
+            b = pf;
+
+        d = b - a;
+        const double sm = std::sqrt(d.squaredNorm() + eps);
+        cost += sm;
+        if (i < overlaps)
+            gradP.col(i) += d / sm;
+        if (i > 0)
+            gradP.col(i - 1) -= d / sm;
+    }
+
+    // backward pass: dcost/dxi via chain rule on r(q)
+    for (int i = 0, j = 0, k; i < overlaps; ++i, j += k)
+    {
+        const auto &OB = vPolys[2 * i + 1];
+        k = (int)OB.cols();
+        Eigen::Map<const Eigen::VectorXd> q(xi.data() + j, k);
+        Eigen::Map<Eigen::VectorXd> g(gradXi.data() + j, k);
+
+        const double sq = q.squaredNorm();
+        const double inv = 1.0 / std::sqrt(sq);
+        const Eigen::VectorXd uq = q * inv;
+
+        g.head(k - 1) = (OB.rightCols(k - 1).transpose() * gradP.col(i)).array() * uq.head(k - 1).array() * 2.0;
+        g(k - 1) = 0.0;                 // slack dim
+        g = (g - uq * uq.dot(g)) * inv; // project to sphere tangent space
+
+        // soft penalty to keep ||q|| >= 1 (same trick as GCOPTER)
+        const double viol = sq - 1.0;
+        if (viol > 0.0)
+        {
+            const double c = viol * viol * viol;
+            const double dc = 3.0 * viol * viol;
+            g += dc * 2.0 * q;
+            cost += c;
+        }
+    }
+
+    return cost;
+}
+
+// Solve for shortest path waypoints: returns [p0, w1, w2, ..., pf]
+inline void getShortestPath(const Eigen::Vector3d &p0,
+                            const Eigen::Vector3d &pf,
+                            const PolyhedraV &vPolys,
+                            double smooth_eps,
+                            Eigen::Matrix3Xd &path)
+{
+    const int overlaps = (int)vPolys.size() / 2;
+    // Decision: for each intersection poly, one vector q \in R^{k} (k = #verts of poly in OB form)
+    Eigen::VectorXi sizes(overlaps);
+    for (int i = 0; i < overlaps; ++i)
+        sizes(i) = vPolys[2 * i + 1].cols();
+
+    Eigen::VectorXd xi(sizes.sum());
+    // init q blocks with uniform weights on sphere
+    for (int i = 0, offset = 0; i < overlaps; ++i)
+    {
+        const int k = sizes(i);
+        xi.segment(offset, k).setConstant(std::sqrt(1.0 / k));
+        offset += k;
+    }
+
+    void *ptrs[4];
+    ptrs[0] = (void *)(&smooth_eps);
+    ptrs[1] = (void *)(&p0);
+    ptrs[2] = (void *)(&pf);
+    ptrs[3] = (void *)(&vPolys);
+
+    double minDist = 0.0;
+    lbfgs::lbfgs_parameter_t sp_params;
+    sp_params.past = 3;
+    sp_params.delta = 1.0e-3;
+    sp_params.g_epsilon = 1.0e-5;
+
+    lbfgs::lbfgs_optimize(xi, minDist, &costDistance, nullptr, nullptr, ptrs, sp_params);
+
+    // decode xi -> points
+    path.resize(3, overlaps + 2);
+    path.col(0) = p0;
+    path.col(overlaps + 1) = pf;
+
+    for (int i = 0, off = 0; i < overlaps; ++i)
+    {
+        const auto &OB = vPolys[2 * i + 1];
+        const int k = (int)OB.cols();
+        Eigen::Map<const Eigen::VectorXd> q(xi.data() + off, k);
+        Eigen::VectorXd r = q.normalized().head(k - 1);
+        path.col(i + 1) = OB.rightCols(k - 1) * r.cwiseProduct(r) + OB.col(0);
+        off += k;
+    }
+}
+
 // -----------------------------------------------------------------------------
 
 SolverLBFGS::SolverLBFGS()
@@ -28,30 +407,27 @@ SolverLBFGS::~SolverLBFGS()
 
 // -----------------------------------------------------------------------------
 
-void SolverLBFGS::initializeSolver(const planner_params_t &params)
+void SolverLBFGS::initializeSolver(const planner_params_t &params, const Eigen::VectorXd &physical_params)
 {
     // Initialize the solver with parameters that won't change throughout the mission
-    verbose_ = params.verbose;                                   // Verbosity level
-    V_nom_ = params.V_nom;                                       // Nominal velocity
-    V_max_ = params.V_max;                                       // Max velocity
-    A_max_ = params.A_max;                                       // Max acceleration
-    J_max_ = params.J_max;                                       // Max jerk
-    num_perturbation_ = params.num_perturbation;                 // Number of perturbations for initial guesses
-    r_max_ = params.r_max;                                       // Perturbation radius for initial guesses
-    time_weight_ = params.time_weight;                           // Weight for time in the objective
-    dyn_weight_ = params.dyn_weight;                             // Weight for dynamic avoidance in the objective
-    stat_weight_ = params.stat_weight;                           // Weight for static avoidance in the objective
-    jerk_weight_ = params.jerk_weight;                           // Weight for jerk in the objective
-    dyn_constr_vel_weight_ = params.dyn_constr_vel_weight;       // Weight for dynamic velocity constraints
-    dyn_constr_acc_weight_ = params.dyn_constr_acc_weight;       // Weight for dynamic acceleration constraints
-    theta_weight_ = params.theta_weight;                         // Weight for tilt angle constraints
-    thrust_min_weight_ = params.thrust_min_weight;               // Weight for minimum thrust constraints
-    thrust_max_weight_ = params.thrust_max_weight;               // Weight for maximum thrust constraints
-    omega_weight_ = params.omega_weight;                         // Weight for angular velocity constraints
-    omega_max_ = params.omega_max;                               // Maximum angular velocity
-    theta_max_ = params.theta_max;                               // Maximum tilt angle
-    thrust_min_ = params.thrust_min;                             // Minimum thrust
-    thrust_max_ = params.thrust_max;                             // Maximum thrust
+    verbose_ = params.verbose;                             // Verbosity level
+    V_nom_ = params.V_nom;                                 // Nominal velocity
+    V_max_ = params.V_max;                                 // Max velocity
+    A_max_ = params.A_max;                                 // Max acceleration
+    J_max_ = params.J_max;                                 // Max jerk
+    num_perturbation_ = params.num_perturbation;           // Number of perturbations for initial guesses
+    r_max_ = params.r_max;                                 // Perturbation radius for initial guesses
+    time_weight_ = params.time_weight;                     // Weight for time in the objective
+    dyn_weight_ = params.dyn_weight;                       // Weight for dynamic avoidance in the objective
+    stat_weight_ = params.stat_weight;                     // Weight for static avoidance in the objective
+    jerk_weight_ = params.jerk_weight;                     // Weight for jerk in the objective
+    dyn_constr_vel_weight_ = params.dyn_constr_vel_weight; // Weight for dynamic velocity constraints
+    dyn_constr_acc_weight_ = params.dyn_constr_acc_weight; // Weight for dynamic acceleration constraints
+    orient_smooth_weight_ = params.orient_smooth_weight;
+    tilt_bias_weight_ = params.tilt_bias_weight;
+    tvar_weight_ = params.tvar_weight;
+    Tmin_weight_ = params.Tmin_weight;
+    Tmin_plan_ = params.Tmin_plan;
     num_dyn_obst_samples_ = params.num_dyn_obst_samples;         // Number of dynamic obstacle samples
     Co_ = params.Co;                                             // Clearance distance for static obstacle avoidance
     Cw_ = params.Cw;                                             // Clearance distance for dynamic obstacle avoidance
@@ -65,7 +441,21 @@ void SolverLBFGS::initializeSolver(const planner_params_t &params)
     // Precompute constants
     Cw2_ = Cw_ * Cw_;
 
-    // --- 2) parameters ---
+    integral_resolution_ = params.integral_resolution; // e.g., 30
+    hinge_mu_ = params.hinge_mu;                       // e.g., 1e-2
+    omege_max_ = params.omega_max;                     // e.g., 6.0
+    tilt_max_rad_ = params.tilt_max_rad;               // e.g., 35° in rad
+    f_min_ = params.f_min;
+    f_max_ = params.f_max;
+    mass_ = params.mass;
+    g_ = params.g;
+
+    dyn_constr_bodyrate_weight_ = params.dyn_constr_bodyrate_weight;
+    dyn_constr_tilt_weight_ = params.dyn_constr_tilt_weight;
+    dyn_constr_thrust_weight_ = params.dyn_constr_thrust_weight;
+
+    // flat map
+    flatmap_.reset(physical_params(0), physical_params(1), physical_params(2), physical_params(3), physical_params(4), physical_params(5));
 }
 
 // -----------------------------------------------------------------------------
@@ -212,58 +602,114 @@ void SolverLBFGS::prepareSolverForReplan(double t0,
     vf_ = goal_state.vel;
     af_ = goal_state.accel;
 
-    if (use_multiple_initial_guesses)
+    // ---- REPLACE HEURISTIC ROUTE WITH SHORTEST-PATH THROUGH THE CORRIDOR ----
     {
-        // Create constraint sets (will be used in buildInitialGuesses) from A_stat_ and b_stat_
-        ConstraintBlocks constraint_sets;
-        for (int idx : joint_indices_)
-        {
-            std::vector<PlaneBlock> blocks;
-            if (A_stat_[idx - 1].rows() > 0)
-                blocks.emplace_back(A_stat_[idx - 1], b_stat_[idx - 1]);
-            if (A_stat_[idx].rows() > 0)
-                blocks.emplace_back(A_stat_[idx], b_stat_[idx]);
-            constraint_sets.push_back(std::move(blocks));
-        }
+        // Skip if any segment has no planes (degenerate corridor)
+        bool corridor_ok = true;
+        for (auto &A : A_stat_)
+            if (A.rows() == 0)
+            {
+                corridor_ok = false;
+                break;
+            }
 
-        // Generate initial guesses
-        auto start_time = std::chrono::high_resolution_clock::now();
-        buildInitialGuesses(constraint_sets);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        // compute initial guess time in ms
-        initial_guess_computation_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+        if (corridor_ok)
+        {
+            // 1) Build H-polytopes (normalize plane rows like GCOPTER does)
+            PolyhedraH hPolys;
+            hPolys.reserve(A_stat_.size());
+            for (size_t i = 0; i < A_stat_.size(); ++i)
+            {
+                const auto &A = A_stat_[i];
+                const auto &b = b_stat_[i];
+
+                PolyhedronH H(A.rows(), 4);
+                H.leftCols<3>() = A;
+                H.col(3) = b;
+
+                // normalize rows by ||n|| to improve numerics
+                Eigen::ArrayXd nn = H.leftCols<3>().rowwise().norm();
+                for (int r = 0; r < H.rows(); ++r)
+                    if (nn(r) > 1e-12)
+                        H.row(r) /= nn(r);
+                hPolys.push_back(std::move(H));
+            }
+
+            // 2) H->V corridor with intersections
+            PolyhedraV vPolys;
+            if (processCorridor(hPolys, vPolys))
+            {
+                // 3) Shortest path inside the corridor
+                const double smooth_eps = 1.0e-6; // small smoothing for stable gradients
+                Eigen::Matrix3Xd path;
+                getShortestPath(x0_, xf_, vPolys, smooth_eps, path);
+
+                // 4) Overwrite global_wps_ with this clean polyline
+                global_wps_.clear();
+                global_wps_.reserve(path.cols());
+                for (int c = 0; c < path.cols(); ++c)
+                    global_wps_.emplace_back(path(0, c), path(1, c), path(2, c));
+
+                // 5) Recompute sizes that depend on the number of segments
+                M_ = (int)global_wps_.size() - 1;
+                joint_indices_.clear();
+                for (int i = 1; i < M_; ++i)
+                    joint_indices_.push_back(i);
+
+                K_cp_ = 9 * (M_ + 1);
+                K_sig_ = M_;
+                K_ = K_cp_ + K_sig_;
+
+                if (verbose_)
+                    std::cout << "[init] Replaced route with corridor-shortest polyline. "
+                              << "M_=" << M_ << ", #wps=" << global_wps_.size() << std::endl;
+            }
+            else if (verbose_)
+            {
+                std::cout << "[init] processCorridor failed (degenerate corridor). "
+                             "Falling back to original route.\n";
+            }
+        }
+        else if (verbose_)
+        {
+            std::cout << "[init] Some segments had no planes; skipping shortest-path init.\n";
+        }
     }
-    else
+    // ------------------------------------------------------------------------------
+
+    // Single initial guess: use min-jerk helper
+    initial_guess_wps_.clear();
+    initial_guess_wps_.push_back(global_wps_);
+
+    list_z0_.clear();
+
+    // Allocate containers
+    Eigen::VectorXd z0;
+    std::vector<Vec3> P, V, A;
+    std::vector<double> T;
+
+    // Time can be computed by deviding the distance by the max velocity
+    for (int i = 0; i < M_; ++i)
     {
-        // Single initial guess: use min-jerk helper
-        initial_guess_wps_.clear();
-        initial_guess_wps_.push_back(global_wps_);
-
-        list_z0_.clear();
-
-        // Allocate containers
-        Eigen::VectorXd z0;
-        std::vector<Vec3> P, V, A;
-        std::vector<double> T;
-
-        // Use the min-jerk initializer
-        auto start_time = std::chrono::high_resolution_clock::now();
-        findInitialGuess(T, V, A);
-        auto end_time = std::chrono::high_resolution_clock::now();
-        // compute initial guess time in ms
-        initial_guess_computation_time = std::chrono::duration<double, std::milli>(end_time - start_time).count();
-
-        for (int i = 0; i < M_ + 1; ++i)
-        {
-            P.push_back(global_wps_[i]);
-        }
-
-        // Generate the initial guess in z form
-        packDecisionVariables(P, V, A, T, z0);
-
-        // Store the results
-        list_z0_.push_back(z0);
+        double dist = (global_wps_[i + 1] - global_wps_[i]).norm();
+        double t = dist / V_max_;
+        T.push_back(t);
     }
+
+    for (int i = 0; i < M_ + 1; ++i)
+    {
+        P.push_back(global_wps_[i]);
+    }
+
+    // Initialize velocities and accelerations
+    //  findInitialGuess(T, V, A);
+    solveMinJerkVelAcc(global_wps_, T, v0_, a0_, vf_, af_, V, A);
+
+    // Generate the initial guess in z form
+    packDecisionVariables(P, V, A, T, z0);
+
+    // Store the results
+    list_z0_.push_back(z0);
 
     // Sanity check
     sanityCheck();
@@ -294,31 +740,40 @@ void SolverLBFGS::packDecisionVariables(
 
     z.resize(K_);
 
-    // 1) pack all (p,v,a) for each knot i=0..M_
+    // 2) pack v̂, â instead of V, A  (use per-knot T̄)
+    std::vector<double> Tbar(M_ + 1);
+    Tbar[0] = T[0];
+    for (int i = 1; i < M_; ++i)
+        Tbar[i] = 0.5 * (T[i - 1] + T[i]);
+    Tbar[M_] = T[M_ - 1];
+
     for (int i = 0; i < M_ + 1; ++i)
     {
         int base = 9 * i;
-        const Vec3 &pi = P[i];
-        const Vec3 &vi = V[i];
-        const Vec3 &ai = A[i];
 
-        z(base + 0) = pi.x();
-        z(base + 1) = pi.y();
-        z(base + 2) = pi.z();
+        // positions (unchanged)
+        z(base + 0) = P[i].x();
+        z(base + 1) = P[i].y();
+        z(base + 2) = P[i].z();
 
-        z(base + 3) = vi.x();
-        z(base + 4) = vi.y();
-        z(base + 5) = vi.z();
+        // v̂ = T̄ * V
+        const Eigen::Vector3d vhat = Tbar[i] * V[i];
+        z(base + 3) = vhat.x();
+        z(base + 4) = vhat.y();
+        z(base + 5) = vhat.z();
 
-        z(base + 6) = ai.x();
-        z(base + 7) = ai.y();
-        z(base + 8) = ai.z();
+        // â = T̄^2 * A
+        const double Tbi2 = Tbar[i] * Tbar[i];
+        const Eigen::Vector3d ahat = Tbi2 * A[i];
+        z(base + 6) = ahat.x();
+        z(base + 7) = ahat.y();
+        z(base + 8) = ahat.z();
     }
 
-    // 2) pack log‐times σ[s] = log(T[s]) for s=0..M_-1
+    // 3) pack τ instead of log T
     for (int s = 0; s < M_; ++s)
     {
-        z[K_cp_ + s] = std::log(T[s]);
+        z[K_cp_ + s] = T_to_tau(T[s]);
     }
 }
 
@@ -342,52 +797,51 @@ void SolverLBFGS::reconstruct(
     T.resize(M_);
     CP.resize(M_);
 
-    // 1) Unpack P, V, A from z[0 .. 9*(M_+1)-1]
+    // 1) unpack P, v̂, â
     for (int i = 0; i < knotCount; ++i)
     {
         int base = 9 * i;
-        P[i].x() = z[base + 0];
-        P[i].y() = z[base + 1];
-        P[i].z() = z[base + 2];
-
-        V[i].x() = z[base + 3];
-        V[i].y() = z[base + 4];
-        V[i].z() = z[base + 5];
-
-        A[i].x() = z[base + 6];
-        A[i].y() = z[base + 7];
-        A[i].z() = z[base + 8];
+        P[i] = {z[base + 0], z[base + 1], z[base + 2]};
+        // store temporarily as hats
+        V[i] = {z[base + 3], z[base + 4], z[base + 5]}; // v̂
+        A[i] = {z[base + 6], z[base + 7], z[base + 8]}; // â
     }
 
-    // 2) Unpack segment durations σ → T
+    // 2) τ → T
+    std::vector<double> tau(M_);
     for (int s = 0; s < M_; ++s)
     {
-        T[s] = std::exp(z[K_cp_ + s]);
+        tau[s] = z[K_cp_ + s];
+        T[s] = tau_to_T(tau[s]);
     }
 
-    // 3) Build Hermite‐quintic control points in CP
-    //    Each segment s has 6 control points in R³
+    // 3) per-knot T̄ and de-scale hats
+    std::vector<double> Tbar(knotCount);
+    Tbar[0] = T[0];
+    for (int i = 1; i < M_; ++i)
+        Tbar[i] = 0.5 * (T[i - 1] + T[i]);
+    Tbar[M_] = T[M_ - 1];
+
+    for (int i = 0; i < knotCount; ++i)
+    {
+        const double Tb = std::max(1e-12, Tbar[i]);
+        // v̂ → V, â → A
+        V[i] = V[i] / Tb;
+        A[i] = A[i] / (Tb * Tb);
+    }
+
+    // 4) CP construction (unchanged)
     for (int s = 0; s < M_; ++s)
     {
-        const Vec3 &p0 = P[s];
-        const Vec3 &v0s = V[s];
-        const Vec3 &a0s = A[s];
-
-        const Vec3 &p1 = P[s + 1];
-        const Vec3 &v1s = V[s + 1];
-        const Vec3 &a1s = A[s + 1];
-
-        double Ts = T[s];
-        double T2 = Ts * Ts;
-
-        // Fill CP[s] = array<Vec3,6>
+        const Vec3 &p0 = P[s], &v0s = V[s], &a0s = A[s];
+        const Vec3 &p1 = P[s + 1], &v1s = V[s + 1], &a1s = A[s + 1];
+        const double Ts = T[s], T2 = Ts * Ts;
         auto &c = CP[s];
-
         c[0] = p0;
-        c[1] = p0 + v0s * (Ts / 5.0);
-        c[2] = p0 + v0s * (2.0 * Ts / 5.0) + a0s * (T2 / 20.0);
-        c[3] = p1 - v1s * (2.0 * Ts / 5.0) + a1s * (T2 / 20.0);
-        c[4] = p1 - v1s * (Ts / 5.0);
+        c[1] = p0 + (Ts / 5.0) * v0s;
+        c[2] = p0 + (2.0 * Ts / 5.0) * v0s + (T2 / 20.0) * a0s;
+        c[3] = p1 - (2.0 * Ts / 5.0) * v1s + (T2 / 20.0) * a1s;
+        c[4] = p1 - (Ts / 5.0) * v1s;
         c[5] = p1;
     }
 }
@@ -680,7 +1134,7 @@ void SolverLBFGS::getGoalSetpoints(std::vector<state> &goal_setpoints)
         }
     }
 
-// 5) parallel fill of goal_setpoints
+    // 5) parallel fill of goal_setpoints
 #pragma omp parallel for
     for (int i = 0; i < N; ++i)
     {
@@ -1069,302 +1523,184 @@ inline void sampleRobotPositionsUniform(
 
 // -----------------------------------------------------------------------------
 
-double SolverLBFGS::evaluateObjective(const VecXd &z) const
+double SolverLBFGS::evaluateObjective(const VecXd &z)
 {
-    // 1) reconstruct P, V, A, CP, and T
+    // Reconstruct
     std::vector<Vec3> P, V, A;
-    std::vector<std::array<Vec3, 6>> CP; // CP[s][0..5]
-    std::vector<double> T;               // T[s]
+    std::vector<std::array<Vec3, 6>> CP;
+    std::vector<double> T;
     reconstruct(z, P, V, A, CP, T);
+    const int M = static_cast<int>(T.size());
+    if (M == 0)
+        return 0.0;
 
-    // 2) time cost
-    double J_time = std::accumulate(T.begin(), T.end(), 0.0);
+    // ---- 1) time ----
+    double J_time = 0.0;
+    for (double Ts : T)
+        J_time += Ts;
 
-    // 3) absolute knot times
-    t_abs_.clear();
-    t_abs_.resize(M_ + 1);
-    t_abs_[0] = t0_;
-    for (int i = 1; i <= M_; ++i)
-        t_abs_[i] = t_abs_[i - 1] + T[i - 1];
-
-    // 4) dynamic‐obstacle (unchanged; right Riemann)
-    int N = (num_dyn_obst_samples_ > 0 ? num_dyn_obst_samples_ : 10);
-    N = std::max(N, 1);
-    std::vector<double> t_samples;
-    std::vector<Vec3> p_samples;
-    sampleRobotPositionsUniform(CP, T, t0_, N, t_samples, p_samples);
-    const double total_T = t_abs_.back() - t0_;
-    const double dt = total_T / N;
-
-    double J_dyn = 0.0;
-    for (const auto &obs : obstacles_)
-    {
-        for (int i = 0; i < N; ++i)
-        {
-            const double t = t_samples[i];
-            const Vec3 &pi = p_samples[i];
-            const Vec3 ki = obs->eval(t);
-            const Vec3 d = pi - ki;
-            const double d2 = d.squaredNorm();
-            const double v = Cw2_ - d2;
-            if (v > 0.0)
-                J_dyn += v * v * v * dt;
-        }
-    }
-
-    // 5) static corridor via CPs (unchanged)
-    double J_stat = 0.0;
-    for (int i = 1; i < M_; ++i)
-    {
-        Vec3 pi = P[i];
-        int segs[2] = {i - 1, i};
-        int nseg = (i < M_) ? 2 : 1;
-        for (int si = 0; si < nseg; ++si)
-        {
-            int p = segs[si];
-            auto const &Aseg = A_stat_[p];
-            auto const &bseg = b_stat_[p];
-            int nplanes = Aseg.rows();
-            for (int k = 0; k < nplanes; ++k)
-            {
-                double h = Aseg.row(k).dot(pi) - bseg[k];
-                double viol = Co_ - h;
-                if (viol > 0.0)
-                    J_stat += viol * viol * viol;
-
-                // if actually h < 0.0, then the point is inside the obstacle -> absolutely infeasible
-                if (h < 0.0)
-                {
-                    // std::cout << "Infeasible static corridor constraint at segment " << p
-                    //           << ", point " << pi.transpose() << ", Aseg.row(k) = "
-                    //           << Aseg.row(k).transpose() << ", bseg[k] = " << bseg[k] << "\n";
-                    return BIG_;
-                }
-            }
-        }
-    }
-
-    // 6) jerk L2 (unchanged)
+    // ---- 2) jerk (closed form per segment) ----
     double J_jerk = 0.0;
-    for (int s = 0; s < M_; ++s)
+    for (int s = 0; s < M; ++s)
     {
         const double Ts = T[s];
-        const double Cs = 3600.0 / std::pow(Ts, 5);
+        const double C = 3600.0 / std::pow(Ts, 5);
         const Vec3 d30 = CP[s][3] - 3.0 * CP[s][2] + 3.0 * CP[s][1] - CP[s][0];
         const Vec3 d31 = CP[s][4] - 3.0 * CP[s][3] + 3.0 * CP[s][2] - CP[s][1];
         const Vec3 d32 = CP[s][5] - 3.0 * CP[s][4] + 3.0 * CP[s][3] - CP[s][2];
-        J_jerk += Cs * (d30.squaredNorm() + d31.squaredNorm() + d32.squaredNorm());
+        J_jerk += C * (d30.squaredNorm() + d31.squaredNorm() + d32.squaredNorm());
     }
 
-    // 7) vel/acc constraints via derivative CPs (unchanged)
-    double J_vel_constr = 0.0, J_acc_constr = 0.0;
-    for (int s = 0; s < M_; ++s)
-    {
-        const double Ts = T[s];
-        const double invT = 1.0 / (Ts + 1e-16);
-        const double alpha = 5.0 * invT;
-        const double beta = 20.0 * invT * invT;
+    // ---- 3) sampled terms in s ∈ [0,1] with dt = T_s / kappa (trapezoid) ----
+    const int kappa = (integral_resolution_ > 0 ? integral_resolution_ : 30);
+    if (kappa <= 0)
+        return time_weight_ * J_time + jerk_weight_ * J_jerk;
 
-        for (int j = 0; j <= 4; ++j)
-        {
-            const Vec3 U = alpha * (CP[s][j + 1] - CP[s][j]);
-            const double dv = std::max(U.norm() - V_max_, 0.0);
-            if (dv > 0.0)
-                J_vel_constr += dv * dv * dv;
-        }
-        for (int j = 0; j <= 3; ++j)
-        {
-            const Vec3 W = beta * (CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j]);
-            const double da = std::max(W.norm() - A_max_, 0.0);
-            if (da > 0.0)
-                J_acc_constr += da * da * da;
-        }
-    }
-
-    // 8) NEW: sampling-free thrust/tilt/body-rate penalties
+    const double mu = (hinge_mu_ > 0.0 ? hinge_mu_ : 1e-2);
+    const double Vmax2 = V_max_ * V_max_;
+    const double Om2 = omege_max_ * omege_max_;
+    const double m = mass_;
+    const double g = g_;
+    const double eps = 1e-12;
     const Vec3 e3(0.0, 0.0, 1.0);
-    const double g = 9.81; // gravity magnitude (e.g., 9.81)
-    double J_thr_max = 0.0, J_thr_min = 0.0, J_theta = 0.0, J_omega = 0.0;
 
-    for (int s = 0; s < M_; ++s)
+    // GCOPTER thrust ring parameters
+    const double f_mean = 0.5 * (f_min_ + f_max_);
+    const double f_radi = 0.5 * std::abs(f_max_ - f_min_);
+    const double f_radi2 = f_radi * f_radi;
+
+    // new accumulators
+    double J_stat = 0.0, J_vel = 0.0, J_om = 0.0, J_tilt = 0.0, J_thr = 0.0, J_om_smooth = 0.0, J_tilt_bias = 0.0, J_Tfloor = 0.0;
+
+    for (int s = 0; s < M; ++s)
     {
         const double Ts = T[s];
-        if (Ts <= 0.0)
-            continue;
+        const double dt = Ts / static_cast<double>(kappa);
 
-        const double invT = 1.0 / (Ts + 1e-16);
-        const double beta = 20.0 * invT * invT;         // accel CP scale
-        const double gamma = 60.0 * invT * invT * invT; // jerk  CP scale
+        // Precompute finite differences of CP (Bezier derivatives in s-space)
+        Vec3 D1[5], D2[4], D3[3];
+        for (int j = 0; j < 5; ++j)
+            D1[j] = CP[s][j + 1] - CP[s][j];
+        for (int j = 0; j < 4; ++j)
+            D2[j] = CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j];
+        for (int j = 0; j < 3; ++j)
+            D3[j] = CP[s][j + 3] - 3.0 * CP[s][j + 2] + 3.0 * CP[s][j + 1] - CP[s][j];
 
-        // thrust/tilt @ accel CPs j=0..3
-        for (int j = 0; j <= 3; ++j)
+        // Static corridor planes (can be empty)
+        const auto &Aseg = A_stat_[s]; // (H x 3)
+        const auto &bseg = b_stat_[s]; // (H)
+        const bool has_planes = (Aseg.rows() > 0);
+
+        for (int j = 0; j <= kappa; ++j)
         {
-            const Vec3 d2 = CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j];
-            const Vec3 W = beta * d2;
-            const Vec3 Wt = W + g * e3;
+            const double wj = (j == 0 || j == kappa) ? 0.5 : 1.0;
+            const double tau = static_cast<double>(j) / static_cast<double>(kappa);
 
-            // thrust max
-            if (thrust_max_weight_ > 0.0)
+            double B5[6], B4[5], B3b[4], B2[3];
+            bernstein5(tau, B5);
+            bernstein4(tau, B4);
+            bernstein3(tau, B3b);
+            bernstein2(tau, B2);
+
+            // x(s), dx/ds, d2x/ds2, d3x/ds3
+            Vec3 x = Vec3::Zero(), dxs = Vec3::Zero(), d2s = Vec3::Zero(), d3s = Vec3::Zero();
+            for (int k = 0; k < 6; ++k)
+                x += B5[k] * CP[s][k];
+            for (int k = 0; k < 5; ++k)
+                dxs += B4[k] * D1[k];
+            for (int k = 0; k < 4; ++k)
+                d2s += B3b[k] * D2[k];
+            for (int k = 0; k < 3; ++k)
+                d3s += B2[k] * D3[k];
+
+            // convert to t-derivatives: v = (5/T)*dxs, a = (20/T^2)*d2s, j = (60/T^3)*d3s
+            const double invT = 1.0 / (Ts + 1e-16);
+            const Vec3 v = (5.0 * invT) * dxs;
+            const Vec3 a = (20.0 * invT * invT) * d2s;
+            const Vec3 jrk = (60.0 * invT * invT * invT) * d3s;
+
+            const double wseg = wj * dt;
+
+            // --- Static corridor: penalize when A x - b < Co_  (same as Python)
+            if (has_planes)
             {
-                const double v = Wt.norm() - thrust_max_;
-                if (v > 0.0)
-                    J_thr_max += v * v * v;
+                for (int h = 0; h < Aseg.rows(); ++h)
+                {
+                    const double gval = Aseg.row(h).dot(x) - bseg[h];
+                    const double viol = Co_ - gval;         // <-- key: use Co_
+                    J_stat += smoothed_l1(viol, mu) * wseg; // smoothed_l1 zeros negatives
+                }
             }
 
-            // thrust min (conservative: on vertical component)
-            if (thrust_min_weight_ > 0.0)
-            {
-                const double v = thrust_min_ - Wt.z();
-                if (v > 0.0)
-                    J_thr_min += v * v * v;
-            }
+            // --- Velocity: y = ||v||^2 - Vmax^2
+            const double yv = v.squaredNorm() - Vmax2;
+            J_vel += smoothed_l1(yv, mu) * wseg;
 
-            // tilt: ||Wt_xy|| <= tan(theta_max) * Wt_z
-            if (theta_weight_ > 0.0)
-            {
-                const double tan_theta_max_ = std::tan(theta_max_);
-                const double nxy = std::sqrt(Wt.x() * Wt.x() + Wt.y() * Wt.y());
-                const double v = nxy - tan_theta_max_ * Wt.z();
-                if (v > 0.0)
-                    J_theta += v * v * v;
-            }
-        }
+            // Get thr, quat, omg
+            double thr;
+            Eigen::Vector4d quat;
+            Eigen::Vector3d omg;
+            flatmap_.forward(v, a, jrk, 0.0, 0.0, thr, quat, omg);
 
-        // body-rate @ jerk CPs j=0..2, coupled with Wt_z at same j
-        if (omega_weight_ > 0.0)
-        {
-            for (int j = 0; j <= 2; ++j)
-            {
-                const Vec3 d3 = CP[s][j + 3] - 3.0 * CP[s][j + 2] + 3.0 * CP[s][j + 1] - CP[s][j];
-                const Vec3 Jv = gamma * d3;
+            // --- Body-rate from (a, j) with yaẇ=0
+            const double viol_omg = omg.squaredNorm() - Om2;
+            J_om += smoothed_l1(viol_omg, mu) * wseg;
 
-                // vertical thrust at same j from accel CPs
-                const Vec3 d2 = CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j];
-                const Vec3 W = beta * d2;
-                const double Wt_z = W.z() + g;
+            // --- Tilt: y = cosθ_max - cosθ, cosθ = e3·b3
+            const double cos_theta = 1.0 - 2.0 * (quat(1) * quat(1) + quat(2) * quat(2));
+            const double viol_theta = acos(cos_theta) - tilt_max_rad_;
+            J_tilt += smoothed_l1(viol_theta, mu) * wseg;
 
-                const double v = Jv.norm() - omega_max_ * Wt_z;
-                if (v > 0.0)
-                    J_omega += v * v * v;
-            }
+            // --- Thrust ring (GCOPTER): y = ((f - f_mean)^2 - f_radi^2)
+            const double viol_thr = (thr - f_mean) * (thr - f_mean) - f_radi2;
+            J_thr += smoothed_l1(viol_thr, mu) * wseg;
         }
     }
 
-    // std::cout << "J_time: " << J_time
-    //           << ", J_dyn: " << J_dyn
-    //           << ", J_stat: " << J_stat
-    //           << ", J_jerk: " << J_jerk
-    //           << ", J_vel_constr: " << J_vel_constr
-    //           << ", J_acc_constr: " << J_acc_constr
-    //           << ", J_thr_max: " << J_thr_max
-    //           << ", J_thr_min: " << J_thr_min
-    //           << ", J_theta: " << J_theta
-    //           << ", J_omega: " << J_omega
-    //           << std::endl;
-
-    // 9) weighted sum
-    return time_weight_ * J_time + dyn_weight_ * J_dyn + stat_weight_ * J_stat + jerk_weight_ * J_jerk + dyn_constr_vel_weight_ * J_vel_constr + dyn_constr_acc_weight_ * J_acc_constr + thrust_max_weight_ * J_thr_max + thrust_min_weight_ * J_thr_min + theta_weight_ * J_theta + omega_weight_ * J_omega;
+    // final weighted sum (add the 4 new terms)
+    return time_weight_ * J_time + jerk_weight_ * J_jerk + stat_weight_ * J_stat + dyn_constr_vel_weight_ * J_vel + dyn_constr_bodyrate_weight_ * J_om + dyn_constr_tilt_weight_ * J_tilt + dyn_constr_thrust_weight_ * J_thr;
 }
 
 // -----------------------------------------------------------------------------
 
-void SolverLBFGS::computeAnalyticalGrad(
-    const Eigen::VectorXd &z,
-    Eigen::VectorXd &grad) const
+void SolverLBFGS::computeAnalyticalGrad(const Eigen::VectorXd &z, Eigen::VectorXd &grad)
 {
-    // 1) Reconstruct P, V, A, CP, T
+    // Reconstruct (used by helpers)
     std::vector<Vec3> P, V, A;
     std::vector<std::array<Vec3, 6>> CP;
     std::vector<double> T;
     reconstruct(z, P, V, A, CP, T);
 
-    // 2) Zero output
-    grad = Eigen::VectorXd::Zero(K_);
+    grad.setZero(K_);
 
-    // 3) Time cost: d/dσ_r ( time_weight * sum_s T_s ) = time_weight * T_r
-    for (int r = 0; r < M_; ++r)
-        grad[K_cp_ + r] += time_weight_ * T[r];
-
-    // 4) Dynamic-obstacle cost (uniform samples, already implemented)
-    if (dyn_weight_ != 0.0 && !obstacles_.empty())
+    // 1) time term: ∂J_time/∂τ_s = w_time * dT/dτ_s
+    for (int s = 0; s < M_; ++s)
     {
-        Eigen::VectorXd g(K_);
-        g.setZero();
-        dJ_dyn_dz(z, P, V, A, CP, T, g); // unweighted
-        grad += dyn_weight_ * g;
+        const double dT = dT_dtau(z[K_cp_ + s]);
+        grad[K_cp_ + s] += time_weight_ * dT;
     }
 
-    // 5) Static corridor penalty
-    if (stat_weight_ != 0.0)
+    // 2) jerk piece
     {
         Eigen::VectorXd g(K_);
         g.setZero();
-        dJ_stat_dz(z, P, T, g); // unweighted
-        grad += stat_weight_ * g;
-    }
-
-    // 6) Jerk L2 penalty
-    if (jerk_weight_ != 0.0)
-    {
-        Eigen::VectorXd g(K_);
-        g.setZero();
-        dJ_jerk_dz(z, P, V, A, CP, T, g); // unweighted
+        dJ_jerk_dz(z, P, V, A, CP, T, g);
         grad += jerk_weight_ * g;
     }
 
-    // 7) Velocity-constraint penalty
-    if (dyn_constr_vel_weight_ != 0.0)
+    // 3) sampled static + dynamic limits (vel, body-rate, tilt, thrust)
     {
         Eigen::VectorXd g(K_);
         g.setZero();
-        dJ_vel_constr_dz(z, P, V, A, CP, T, g); // unweighted
-        grad += dyn_constr_vel_weight_ * g;
+        dJ_limits_and_static_dz(z, P, V, A, CP, T, g); // thrust update is inside this helper
+        grad += g;                                     // weights applied per-term inside the helper
     }
 
-    // 8) Acceleration-constraint penalty
-    if (dyn_constr_acc_weight_ != 0.0)
+    // 4) lock endpoints (p0,v0,a0) and (pM,vM,aM)
+    for (int k = 0; k < 9; ++k)
     {
-        Eigen::VectorXd g(K_);
-        g.setZero();
-        dJ_acc_constr_dz(z, P, V, A, CP, T, g); // unweighted
-        grad += dyn_constr_acc_weight_ * g;
-    }
-
-    // 9) NEW: Thrust/tilt/body-rate penalties (sampling-free, Bézier-CP based)
-    if (thrust_max_weight_ != 0.0)
-    {
-        Eigen::VectorXd g(K_);
-        g.setZero();
-        dJ_thrust_max_dz(z, P, V, A, CP, T, g); // unweighted
-        grad += thrust_max_weight_ * g;
-    }
-    if (thrust_min_weight_ != 0.0)
-    {
-        Eigen::VectorXd g(K_);
-        g.setZero();
-        dJ_thrust_min_dz(z, P, V, A, CP, T, g); // unweighted
-        grad += thrust_min_weight_ * g;
-    }
-    if (theta_weight_ != 0.0)
-    {
-        Eigen::VectorXd g(K_);
-        g.setZero();
-        dJ_theta_dz(z, P, V, A, CP, T, g); // unweighted
-        grad += theta_weight_ * g;
-    }
-    if (omega_weight_ != 0.0)
-    {
-        Eigen::VectorXd g(K_);
-        g.setZero();
-        dJ_omega_dz(z, P, V, A, CP, T, g); // unweighted
-        grad += omega_weight_ * g;
-    }
-
-    // 10) Zero endpoints: (p0,v0,a0) and (pM,vM,aM)
-    for (int i = 0; i < 9; ++i)
-    {
-        grad[i] = 0.0;             // P0, V0, A0
-        grad[K_cp_ - 9 + i] = 0.0; // Pf, Vf, Af
+        grad[k] = 0.0;
+        grad[K_cp_ - 9 + k] = 0.0;
     }
 }
 
@@ -1372,7 +1708,7 @@ void SolverLBFGS::computeAnalyticalGrad(
 
 double SolverLBFGS::evaluateObjectiveAndGradient(
     const Eigen::VectorXd &z,
-    Eigen::VectorXd &g) const
+    Eigen::VectorXd &g)
 {
 
     // auto t_objective_start = std::chrono::high_resolution_clock::now();
@@ -1412,7 +1748,7 @@ int SolverLBFGS::progressCallback(
 {
     // std::cout << "iter=" << k << " f=" << f << " z=" << z.transpose() << " |g|=" << g.norm() << std::endl;
     // std::cout << "iter=" << k << " f=" << f << " |g|=" << g.norm() << std::endl;
-    printf("iter=%d f=%.6f |g|=%.6f\n", k, f, g.norm());
+    // printf("iter=%d f=%.6f |g|=%.6f\n", k, f, g.norm());
     return 0; // return non‐zero to abort optimization early
 }
 
@@ -1474,9 +1810,6 @@ void SolverLBFGS::setStaticConstraints(
         Eigen::VectorXd b =
             lc.b().template cast<double>();
 
-        A = -A;
-        b = -b;
-
         A_stat_.push_back(std::move(A));
         b_stat_.push_back(std::move(b));
     }
@@ -1512,31 +1845,6 @@ void SolverLBFGS::reconstructPVATCPopt(const Eigen::VectorXd &z)
 }
 
 //------------------------------------------------------------------------------
-
-inline void bernstein5(double u, double B[6])
-{
-    const double um = 1.0 - u;
-    const double u2 = u * u, u3 = u2 * u, u4 = u3 * u, u5 = u4 * u;
-    const double m2 = um * um, m3 = m2 * um, m4 = m3 * um, m5 = m4 * um;
-    B[0] = m5;
-    B[1] = 5.0 * u * m4;
-    B[2] = 10.0 * u2 * m3;
-    B[3] = 10.0 * u3 * m2;
-    B[4] = 5.0 * u4 * um;
-    B[5] = u5;
-}
-
-inline void bernstein4(double u, double b[5])
-{
-    const double um = 1.0 - u;
-    const double u2 = u * u, u3 = u2 * u, u4 = u3 * u;
-    const double m2 = um * um, m3 = m2 * um, m4 = m3 * um;
-    b[0] = m4;
-    b[1] = 4.0 * u * m3;
-    b[2] = 6.0 * u2 * m2;
-    b[3] = 4.0 * u3 * um;
-    b[4] = u4;
-}
 
 inline void accumulate_cp_to_pvaT(
     int s,
@@ -1824,41 +2132,81 @@ Eigen::Vector3d SolverLBFGS::evalObs(
 
 void SolverLBFGS::dJ_stat_dz(const VecXd &z,
                              const std::vector<Vec3> &P,
+                             const std::vector<Vec3> &V,
+                             const std::vector<Vec3> &A,
+                             const std::vector<std::array<Vec3, 6>> &CP,
                              const std::vector<double> &T,
                              VecXd &grad) const
 {
-    // 2) Loop over interior knots i=1..M_-1
-    for (int i = 1; i < M_; ++i)
+    // accumulators for p,v,a,T
+    std::vector<Vec3> gP(M_ + 1, Vec3::Zero());
+    std::vector<Vec3> gV(M_ + 1, Vec3::Zero());
+    std::vector<Vec3> gA(M_ + 1, Vec3::Zero());
+    std::vector<double> gT(M_, 0.0);
+
+    for (int s = 0; s < M_; ++s)
     {
-        const Vec3 &Pi = P[i];
-        // Determine which segments’ planes apply
-        int segs[2] = {i - 1, i};
-        int nseg = (i < M_) ? 2 : 1;
+        const auto &Aseg = A_stat_[s]; // (nplanes x 3)
+        const auto &bseg = b_stat_[s]; // (nplanes)
+        if (Aseg.rows() == 0)
+            continue;
 
-        for (int si = 0; si < nseg; ++si)
+        const double Ts = T[s];
+        const double Ts2 = Ts * Ts;
+
+        // grad wrt CP of this segment
+        std::array<Vec3, 6> gCP;
+        for (auto &g : gCP)
+            g.setZero();
+
+        // For each control point j and plane k:
+        for (int j = 0; j < 6; ++j)
         {
-            int segIdx = segs[si];
-            // A_stat_[segIdx]: (nplanes × 3), b_stat_[segIdx]: length nplanes
-            const auto &Aseg = A_stat_[segIdx];
-            const auto &bseg = b_stat_[segIdx];
-            int nplanes = Aseg.rows();
-
-            for (int p = 0; p < nplanes; ++p)
+            const Vec3 Bj = CP[s][j];
+            for (int k = 0; k < Aseg.rows(); ++k)
             {
-                // signed distance
-                double h = Aseg.row(p).dot(Pi) - bseg[p];
-                double viol = Co_ - h;
+                const double h = Aseg.row(k).dot(Bj) - bseg[k]; // h = A·x - b
+                if (h < 0.0)
+                {
+                    // hard infeasible (optional): mirror your objective
+                    // return; // or set a flag
+                }
+                const double viol = Co_ - h;
                 if (viol <= 0.0)
                     continue;
 
-                // gradient w.r.t. P_i
-                double coeff = -3.0 * viol * viol;
-                Vec3 dJ_dPi = coeff * Aseg.row(p).transpose();
-
-                // accumulate into grad
-                grad.segment<3>(9 * i) += dJ_dPi;
+                // d/dBj [ (Co - h)^3 ] = -3 (Co - h)^2 A_k
+                gCP[j] += -3.0 * viol * viol * Aseg.row(k).transpose();
             }
         }
+
+        // Push gCP -> p,v,a of endpoints via Hermite->Bézier map
+        gP[s] += gCP[0] + gCP[1] + gCP[2];
+        gV[s] += (Ts / 5.0) * gCP[1] + (2.0 * Ts / 5.0) * gCP[2];
+        gA[s] += (Ts2 / 20.0) * gCP[2];
+
+        gP[s + 1] += gCP[3] + gCP[4] + gCP[5];
+        gV[s + 1] += (-2.0 * Ts / 5.0) * gCP[3] + (-Ts / 5.0) * gCP[4];
+        gA[s + 1] += (Ts2 / 20.0) * gCP[3];
+
+        // dJ/dT through CP(T) dependence
+        gT[s] += gCP[1].dot(V[s] / 5.0);
+        gT[s] += gCP[2].dot((2.0 / 5.0) * V[s] + (Ts / 10.0) * A[s]);
+        gT[s] += gCP[3].dot((-2.0 / 5.0) * V[s + 1] + (Ts / 10.0) * A[s + 1]);
+        gT[s] += gCP[4].dot((-1.0 / 5.0) * V[s + 1]);
+    }
+
+    // Scatter into z (σ has T = exp σ ⇒ ∂/∂σ = T ∂/∂T)
+    for (int i = 0; i <= M_; ++i)
+    {
+        const int base = 9 * i;
+        grad.segment<3>(base + 0) += gP[i];
+        grad.segment<3>(base + 3) += gV[i];
+        grad.segment<3>(base + 6) += gA[i];
+    }
+    for (int s = 0; s < M_; ++s)
+    {
+        grad[K_cp_ + s] += gT[s] * T[s];
     }
 }
 
@@ -1872,77 +2220,475 @@ void SolverLBFGS::dJ_jerk_dz(const VecXd &z,
                              const std::vector<double> &T,
                              VecXd &grad) const
 {
+    const int M = static_cast<int>(T.size());
+    const int knots = M + 1;
 
-    // 2) loop over segments
-    for (int s = 0; s < M_; ++s)
+    // accumulators in (P,V,A,T) space
+    std::vector<Vec3> gP(knots, Vec3::Zero());
+    std::vector<Vec3> gV(knots, Vec3::Zero());
+    std::vector<Vec3> gA(knots, Vec3::Zero());
+    std::vector<double> gT(M, 0.0);
+
+    for (int s = 0; s < M; ++s)
     {
-        double Ts = T[s];
-        double T2 = Ts * Ts;
-        double invT5 = 1.0 / std::pow(Ts, 5);
-        double invT6 = invT5 / Ts;
-        double C = 3600.0 * invT5;
-        double dC_dT = -5.0 * 3600.0 * invT6;
+        const double Ts = T[s];
+        const double T2 = Ts * Ts;
+        const double C = 3600.0 / std::pow(Ts, 5);
 
-        // compute the three third‐differences
-        Vec3 d30 = CP[s][3] - 3.0 * CP[s][2] + 3.0 * CP[s][1] - CP[s][0];
-        Vec3 d31 = CP[s][4] - 3.0 * CP[s][3] + 3.0 * CP[s][2] - CP[s][1];
-        Vec3 d32 = CP[s][5] - 3.0 * CP[s][4] + 3.0 * CP[s][3] - CP[s][2];
+        const Vec3 d30 = CP[s][3] - 3.0 * CP[s][2] + 3.0 * CP[s][1] - CP[s][0];
+        const Vec3 d31 = CP[s][4] - 3.0 * CP[s][3] + 3.0 * CP[s][2] - CP[s][1];
+        const Vec3 d32 = CP[s][5] - 3.0 * CP[s][4] + 3.0 * CP[s][3] - CP[s][2];
 
-        // sum of squared norms
-        double sum_norm2 = d30.squaredNorm() + d31.squaredNorm() + d32.squaredNorm();
+        // dJ/dCP via ∂/∂(Δ3)^T(Δ3) chain
+        Vec3 dJdCP[6] = {Vec3::Zero(), Vec3::Zero(), Vec3::Zero(),
+                         Vec3::Zero(), Vec3::Zero(), Vec3::Zero()};
+        auto add = [&](int i, const Vec3 &v)
+        { dJdCP[i] += 2.0 * C * v; };
+        // m=0
+        add(0, -d30);
+        add(1, 3.0 * d30);
+        add(2, -3.0 * d30);
+        add(3, d30);
+        // m=1
+        add(1, -d31);
+        add(2, 3.0 * d31);
+        add(3, -3.0 * d31);
+        add(4, d31);
+        // m=2
+        add(2, -d32);
+        add(3, 3.0 * d32);
+        add(4, -3.0 * d32);
+        add(5, d32);
 
-        // 3) build dJ/dCP array
-        std::array<Vec3, 6> dJ_dCP;
-        for (auto &v : dJ_dCP)
-            v.setZero();
+        // CP -> (P,V,A) and explicit T terms
+        gP[s] += dJdCP[0] + dJdCP[1] + dJdCP[2];
+        gV[s] += (Ts / 5.0) * dJdCP[1] + (2.0 * Ts / 5.0) * dJdCP[2];
+        gA[s] += (T2 / 20.0) * dJdCP[2];
 
-        // m=0: coeffs [-1,3,-3,1] at j=0,1,2,3
-        dJ_dCP[0] += 2.0 * C * (-1.0) * d30;
-        dJ_dCP[1] += 2.0 * C * (3.0) * d30;
-        dJ_dCP[2] += 2.0 * C * (-3.0) * d30;
-        dJ_dCP[3] += 2.0 * C * (1.0) * d30;
-        // m=1: [-1,3,-3,1] at j=1,2,3,4
-        dJ_dCP[1] += 2.0 * C * (-1.0) * d31;
-        dJ_dCP[2] += 2.0 * C * (3.0) * d31;
-        dJ_dCP[3] += 2.0 * C * (-3.0) * d31;
-        dJ_dCP[4] += 2.0 * C * (1.0) * d31;
-        // m=2: [-1,3,-3,1] at j=2,3,4,5
-        dJ_dCP[2] += 2.0 * C * (-1.0) * d32;
-        dJ_dCP[3] += 2.0 * C * (3.0) * d32;
-        dJ_dCP[4] += 2.0 * C * (-3.0) * d32;
-        dJ_dCP[5] += 2.0 * C * (1.0) * d32;
+        gP[s + 1] += dJdCP[3] + dJdCP[4] + dJdCP[5];
+        gV[s + 1] += (-2.0 * Ts / 5.0) * dJdCP[3] + (-Ts / 5.0) * dJdCP[4];
+        gA[s + 1] += (T2 / 20.0) * dJdCP[3];
 
-        // 4) propagate into z‐entries:
-        int base_s = 9 * s;
-        int base_sp1 = 9 * (s + 1);
+        gT[s] += dJdCP[1].dot(V[s] / 5.0);
+        gT[s] += dJdCP[2].dot((2.0 / 5.0) * V[s] + (Ts / 10.0) * A[s]);
+        gT[s] += dJdCP[3].dot((-2.0 / 5.0) * V[s + 1] + (Ts / 10.0) * A[s + 1]);
+        gT[s] += dJdCP[4].dot((-1.0 / 5.0) * V[s + 1]);
 
-        // P[s]
-        grad.segment<3>(base_s) += dJ_dCP[0] + dJ_dCP[1] + dJ_dCP[2];
-        // V[s]
-        grad.segment<3>(base_s + 3) += dJ_dCP[1] * (Ts / 5.0) + dJ_dCP[2] * (2.0 * Ts / 5.0);
-        // A[s]
-        grad.segment<3>(base_s + 6) += dJ_dCP[2] * (T2 / 20.0);
+        // explicit ∂/∂T of the 1/T^5 factor
+        const double S = d30.squaredNorm() + d31.squaredNorm() + d32.squaredNorm();
+        gT[s] += (-5.0) * (3600.0 / std::pow(Ts, 6)) * S;
+    }
 
-        // P[s+1]
-        grad.segment<3>(base_sp1) += dJ_dCP[3] + dJ_dCP[4] + dJ_dCP[5];
-        // V[s+1]
-        grad.segment<3>(base_sp1 + 3) += dJ_dCP[3] * (-2.0 * Ts / 5.0) + dJ_dCP[4] * (-Ts / 5.0);
-        // A[s+1]
-        grad.segment<3>(base_sp1 + 6) += dJ_dCP[3] * (T2 / 20.0);
+    // (a) scatter (P,V,A) -> z=[p,v̂,â,τ] with the T̄-decoding
+    std::vector<double> Tbar;
+    build_Tbar(T, Tbar);
 
-        // 5) propagate into σ_s
-        //    a) through the CP‐dependence (each term picks up a *Ts)
-        Vec3 Vs = V[s], As = A[s];
-        Vec3 Vsp = V[s + 1], Asp = A[s + 1];
-        double term =
-            dJ_dCP[1].dot(Vs / 5.0) +
-            dJ_dCP[2].dot(2.0 * Vs / 5.0 + Ts * As / 10.0) +
-            dJ_dCP[3].dot(-2.0 * Vsp / 5.0 + Ts * Asp / 10.0) +
-            dJ_dCP[4].dot(-Vsp / 5.0);
-        grad[K_cp_ + s] += Ts * term;
+    auto vhat_i = [&](int i)
+    { return Vec3(z[9 * i + 3], z[9 * i + 4], z[9 * i + 5]); };
+    auto ahat_i = [&](int i)
+    { return Vec3(z[9 * i + 6], z[9 * i + 7], z[9 * i + 8]); };
 
-        //    b) through the C_s factor itself
-        grad[K_cp_ + s] += dC_dT * sum_norm2 * Ts;
+    // accumulate ∂J/∂p, ∂J/∂v̂, ∂J/∂â
+    std::vector<double> gTbar(knots, 0.0);
+    for (int i = 0; i < knots; ++i)
+    {
+        const int base = 9 * i;
+        const double Tb = std::max(1e-12, Tbar[i]);
+
+        // dJ/dp, dJ/dv̂, dJ/dâ
+        grad.segment<3>(base + 0) += gP[i];
+        grad.segment<3>(base + 3) += (1.0 / Tb) * gV[i];
+        grad.segment<3>(base + 6) += (1.0 / (Tb * Tb)) * gA[i];
+
+        // extra through T̄
+        gTbar[i] += -gV[i].dot(vhat_i(i)) / (Tb * Tb) - 2.0 * gA[i].dot(ahat_i(i)) / (Tb * Tb * Tb);
+    }
+
+    // (b) add the T̄→{T_s} contributions to segment ∂J/∂T
+    std::vector<double> gTextra(M, 0.0);
+    distribute_gTbar_to_segments(gTbar, gTextra);
+    for (int s = 0; s < M; ++s)
+        gT[s] += gTextra[s];
+
+    // (c) chain to τ via dT/dτ (GCOPTER map) and accumulate into z
+    for (int s = 0; s < M; ++s)
+    {
+        const double dTdtau = dT_dtau(z[K_cp_ + s]);
+        grad[K_cp_ + s] += gT[s] * dTdtau;
+    }
+}
+
+// -----------------------------------------------------------------------------
+
+// GCOPTER-style smoothed L1: returns (active?, f, df) for x>=0 with a C2 middle piece
+inline bool smoothedL1_gc(const double &x, const double &mu, double &f, double &df)
+{
+    if (x < 0.0) { f = 0.0; df = 0.0; return false; }
+    if (x > mu)  { f = x - 0.5 * mu; df = 1.0; return true; }
+    const double xdmu = x / mu;
+    const double xdmu2 = xdmu * xdmu;        // (x/μ)^2
+    const double mumxd2 = mu - 0.5 * x;      // μ - x/2
+    f  = mumxd2 * xdmu2 * xdmu;              // (μ - x/2) * (x/μ)^3
+    df = xdmu2 * ( -0.5 * xdmu + 3.0 * mumxd2 / mu );
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+
+void SolverLBFGS::dJ_limits_and_static_dz(const VecXd &z,
+                                          const std::vector<Vec3> &P,
+                                          const std::vector<Vec3> &V,
+                                          const std::vector<Vec3> &A,
+                                          const std::vector<std::array<Vec3, 6>> &CP,
+                                          const std::vector<double> &T,
+                                          VecXd &grad)
+{
+    const int M = static_cast<int>(T.size());
+    const int knots = M + 1;
+
+    // accumulators in (P,V,A,T) space
+    std::vector<Vec3> gP(knots, Vec3::Zero());
+    std::vector<Vec3> gV(knots, Vec3::Zero());
+    std::vector<Vec3> gA(knots, Vec3::Zero());
+    std::vector<double> gT(M, 0.0);
+
+    const int kappa = (integral_resolution_ > 0 ? integral_resolution_ : 30);
+    if (kappa <= 0)
+        return;
+
+    const double mu = (hinge_mu_ > 0.0 ? hinge_mu_ : 1e-2);
+    const double Vmax2 = V_max_ * V_max_;
+    const double Om2 = omege_max_ * omege_max_;
+    const double cos_tilt_max = std::cos(tilt_max_rad_);
+    const double m = mass_, g = g_;
+    const Vec3 e3(0.0, 0.0, 1.0);
+
+    // GCOPTER thrust ring parameters (mean + radius)
+    const double f_mean = 0.5 * (f_min_ + f_max_);
+    const double f_radi = 0.5 * std::abs(f_max_ - f_min_);
+    const double f_radi2 = f_radi * f_radi;
+
+    for (int s = 0; s < M; ++s)
+    {
+        const double Ts = T[s];
+        const double dt = Ts / static_cast<double>(kappa);
+        const double invT = 1.0 / (Ts + 1e-16);
+
+        // Precompute Bézier differences (shape-space, no 5/20/60 factors here)
+        Vec3 D1[5], D2[4], D3[3];
+        for (int j = 0; j < 5; ++j)
+            D1[j] = CP[s][j + 1] - CP[s][j];
+        for (int j = 0; j < 4; ++j)
+            D2[j] = CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j];
+        for (int j = 0; j < 3; ++j)
+            D3[j] = CP[s][j + 3] - 3.0 * CP[s][j + 2] + 3.0 * CP[s][j + 1] - CP[s][j];
+
+        // Static planes (can be empty)
+        const auto &Aseg = A_stat_[s];
+        const auto &bseg = b_stat_[s];
+        const bool has_planes = (Aseg.rows() > 0);
+
+        // per-segment CP gradient bucket
+        Vec3 gCP[6] = {Vec3::Zero(), Vec3::Zero(), Vec3::Zero(),
+                       Vec3::Zero(), Vec3::Zero(), Vec3::Zero()};
+
+        for (int j = 0; j <= kappa; ++j)
+        {
+            const double wj = (j == 0 || j == kappa) ? 0.5 : 1.0;
+            const double tau = (kappa == 0 ? 0.0 : double(j) / double(kappa));
+
+            double B5[6], B4[5], B3b[4], B2[3];
+            bernstein5(tau, B5);
+            bernstein4(tau, B4);
+            bernstein3(tau, B3b);
+            bernstein2(tau, B2);
+
+            // shape-space derivatives (no factors)
+            Vec3 x = Vec3::Zero(), d1s = Vec3::Zero(), d2s = Vec3::Zero(), d3s = Vec3::Zero();
+            for (int k = 0; k < 6; ++k)
+                x += B5[k] * CP[s][k];
+            for (int k = 0; k < 5; ++k)
+                d1s += B4[k] * D1[k];
+            for (int k = 0; k < 4; ++k)
+                d2s += B3b[k] * D2[k];
+            for (int k = 0; k < 3; ++k)
+                d3s += B2[k] * D3[k];
+
+            // physical derivatives
+            const Vec3 v = (5.0 * invT) * d1s;                  // v = (5/T) d1
+            const Vec3 acc = (20.0 * invT * invT) * d2s;        // a = (20/T^2) d2
+            const Vec3 jrk = (60.0 * invT * invT * invT) * d3s; // j = (60/T^3) d3
+
+            const double wseg = wj * dt;
+
+            // --- Static corridor: Ax - b >= 0  -> penalize (-g)_+ ---
+            if (has_planes)
+            {
+                for (int h = 0; h < Aseg.rows(); ++h)
+                {
+                    const double gval = Aseg.row(h).dot(x) - bseg[h];
+                    if (gval < Co_) // match Python: penalize when g < Co
+                    {
+                        const double viol = Co_ - gval; // >0 inside the clearance band
+                        const double phi_p = smoothed_l1_prime(viol, mu);
+
+                        // ∂J/∂x = -φ'(viol) * Aᵀ * (w_stat * wseg)
+                        const Vec3 gx = -(phi_p)*Aseg.row(h).transpose() * (stat_weight_ * wseg);
+
+                        // x = Σ B5 * CP  ⇒  ∂J/∂CP_j += B5_j * gx
+                        for (int k = 0; k < 6; ++k)
+                            gCP[k] += B5[k] * gx;
+
+                        // dt-only path: ∂(wseg)/∂T = wj / kappa
+                        gT[s] += stat_weight_ * (wj / (double)kappa) * smoothed_l1(viol, mu);
+                    }
+                }
+            }
+
+            // --- Velocity: y = ||v||^2 - Vmax^2 ---
+            {
+                const double yv = v.squaredNorm() - Vmax2;
+                if (yv > 0.0)
+                {
+                    const double phi_p = smoothed_l1_prime(yv, mu);
+                    const Vec3 gv = (2.0 * phi_p) * v * (dyn_constr_vel_weight_ * wseg); // ∂J/∂v
+
+                    // v = (5/T) d1  ⇒  ∂J/∂d1 = (5/T) gv  (we do: g1 = gv * (1/T), then multiply by 5 in stencil)
+                    const Vec3 g1 = gv * invT;
+                    for (int k = 0; k < 5; ++k)
+                    {
+                        const Vec3 G1k = (5.0 * B4[k]) * g1;
+                        gCP[k] -= G1k;
+                        gCP[k + 1] += G1k;
+                    }
+
+                    // dt-only + T-scale path (v)
+                    gT[s] += dyn_constr_vel_weight_ * (wj / (double)kappa) * smoothed_l1(yv, mu);
+                    gT[s] += -5.0 * gv.dot(d1s) / (Ts * Ts); // ∂v/∂T = -(5/T^2)d1
+                }
+            }
+
+            // Common pieces for a/j
+            double thr;
+            Eigen::Vector4d quat;
+            Eigen::Vector3d omg;
+            flatmap_.forward(v, acc, jrk, 0.0, 0.0, thr, quat, omg);
+
+            // --- Body-rate via flatness map: y = ||ω||^2 - Ω^2  -------------------------
+            {
+                double pena, dpena;
+                if (smoothedL1_gc(omg.squaredNorm() - Om2, mu, pena, dpena))
+                {
+                    // grads in flatness outputs
+                    const Vec3 pos_grad = Vec3::Zero();
+                    const Vec3 vel_grad = Vec3::Zero();
+                    const double thr_grad = 0.0;
+                    Eigen::Vector4d quat_grad = Eigen::Vector4d::Zero();
+                    Vec3 omg_grad = (2.0 * dpena) * omg;
+                    omg_grad *= (dyn_constr_bodyrate_weight_ * wseg);
+
+                    // backprop to (v, a, j)
+                    Vec3 totalPos, totalVel, totalAcc, totalJer;
+                    double totalPsi, totalPsiD;
+                    flatmap_.backward(pos_grad, vel_grad, thr_grad, quat_grad, omg_grad,
+                                      totalPos, totalVel, totalAcc, totalJer,
+                                      totalPsi, totalPsiD);
+
+                    // push to CP: v=(5/T)d1, a=(20/T^2)d2, j=(60/T^3)d3
+                    const Vec3 g1 = totalVel * invT;
+                    for (int k = 0; k < 5; ++k)
+                    {
+                        const Vec3 G1k = (5.0 * B4[k]) * g1;
+                        gCP[k] -= G1k;
+                        gCP[k + 1] += G1k;
+                    }
+                    const Vec3 g2_d2s = totalAcc / (Ts * Ts);
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const Vec3 G2k = (20.0 * B3b[k]) * g2_d2s;
+                        gCP[k] += G2k;
+                        gCP[k + 1] -= 2.0 * G2k;
+                        gCP[k + 2] += G2k;
+                    }
+                    const Vec3 g3_d3s = totalJer / (Ts * Ts * Ts);
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const Vec3 G3k = (60.0 * B2[k]) * g3_d3s;
+                        gCP[k] -= G3k;
+                        gCP[k + 1] += 3.0 * G3k;
+                        gCP[k + 2] -= 3.0 * G3k;
+                        gCP[k + 3] += G3k;
+                    }
+
+                    // dt-only + T-scale paths
+                    gT[s] += dyn_constr_bodyrate_weight_ * (wj / (double)kappa) * pena;
+                    gT[s] += -5.0 * totalVel.dot(d1s) / (Ts * Ts);
+                    gT[s] += -40.0 * totalAcc.dot(d2s) / std::pow(Ts, 3);
+                    gT[s] += -180.0 * totalJer.dot(d3s) / std::pow(Ts, 4);
+                }
+            }
+
+            // --- Tilt via quaternion: θ = acos(cosθ),  cosθ = 1 - 2(qx^2 + qy^2) --------
+            {
+                const double qx = quat(1), qy = quat(2);
+                double cos_t = 1.0 - 2.0 * (qx * qx + qy * qy);
+                // numeric safety
+                cos_t = (cos_t < -1.0 ? -1.0 : (cos_t > 1.0 ? 1.0 : cos_t));
+                const double theta = std::acos(cos_t);
+
+                double pena, dpena;
+                if (smoothedL1_gc(theta - tilt_max_rad_, mu, pena, dpena))
+                {
+                    // dθ/dquat = (4 / sqrt(1 - cos^2)) * [0, qx, qy, 0]
+                    const double s = std::sqrt(std::max(1.0 - cos_t * cos_t, 1e-16));
+                    Eigen::Vector4d quat_grad = Eigen::Vector4d::Zero();
+                    quat_grad(1) = 4.0 * qx / s;
+                    quat_grad(2) = 4.0 * qy / s;
+                    quat_grad *= (dpena * dyn_constr_tilt_weight_ * wseg);
+
+                    const Vec3 pos_grad = Vec3::Zero(), vel_grad = Vec3::Zero(), omg_grad = Vec3::Zero();
+                    const double thr_grad = 0.0;
+
+                    Vec3 totalPos, totalVel, totalAcc, totalJer;
+                    double totalPsi, totalPsiD;
+                    flatmap_.backward(pos_grad, vel_grad, thr_grad, quat_grad, omg_grad,
+                                      totalPos, totalVel, totalAcc, totalJer,
+                                      totalPsi, totalPsiD);
+
+                    // push to CP
+                    const Vec3 g1 = totalVel * invT;
+                    for (int k = 0; k < 5; ++k)
+                    {
+                        const Vec3 G1k = (5.0 * B4[k]) * g1;
+                        gCP[k] -= G1k;
+                        gCP[k + 1] += G1k;
+                    }
+                    const Vec3 g2_d2s = totalAcc / (Ts * Ts);
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const Vec3 G2k = (20.0 * B3b[k]) * g2_d2s;
+                        gCP[k] += G2k;
+                        gCP[k + 1] -= 2.0 * G2k;
+                        gCP[k + 2] += G2k;
+                    }
+                    const Vec3 g3_d3s = totalJer / (Ts * Ts * Ts);
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const Vec3 G3k = (60.0 * B2[k]) * g3_d3s;
+                        gCP[k] -= G3k;
+                        gCP[k + 1] += 3.0 * G3k;
+                        gCP[k + 2] -= 3.0 * G3k;
+                        gCP[k + 3] += G3k;
+                    }
+
+                    gT[s] += dyn_constr_tilt_weight_ * (wj / (double)kappa) * pena;
+                    gT[s] += -5.0 * totalVel.dot(d1s) / (Ts * Ts);
+                    gT[s] += -40.0 * totalAcc.dot(d2s) / std::pow(Ts, 3);
+                    gT[s] += -180.0 * totalJer.dot(d3s) / std::pow(Ts, 4);
+                }
+            }
+
+            // --- Thrust ring via flatness map: ((thr - f_mean)^2 - f_radi^2) -------------
+            {
+                const double df = thr - f_mean;
+                double pena, dpena;
+                if (smoothedL1_gc(df * df - f_radi2, mu, pena, dpena))
+                {
+                    const double thr_grad = 2.0 * df * dpena * (dyn_constr_thrust_weight_ * wseg);
+
+                    const Vec3 pos_grad = Vec3::Zero(), vel_grad = Vec3::Zero(), omg_grad = Vec3::Zero();
+                    const Eigen::Vector4d quat_grad = Eigen::Vector4d::Zero();
+
+                    Vec3 totalPos, totalVel, totalAcc, totalJer;
+                    double totalPsi, totalPsiD;
+                    flatmap_.backward(pos_grad, vel_grad, thr_grad, quat_grad, omg_grad,
+                                      totalPos, totalVel, totalAcc, totalJer,
+                                      totalPsi, totalPsiD);
+
+                    // push to CP
+                    const Vec3 g1 = totalVel * invT;
+                    for (int k = 0; k < 5; ++k)
+                    {
+                        const Vec3 G1k = (5.0 * B4[k]) * g1;
+                        gCP[k] -= G1k;
+                        gCP[k + 1] += G1k;
+                    }
+                    const Vec3 g2_d2s = totalAcc / (Ts * Ts);
+                    for (int k = 0; k < 4; ++k)
+                    {
+                        const Vec3 G2k = (20.0 * B3b[k]) * g2_d2s;
+                        gCP[k] += G2k;
+                        gCP[k + 1] -= 2.0 * G2k;
+                        gCP[k + 2] += G2k;
+                    }
+                    const Vec3 g3_d3s = totalJer / (Ts * Ts * Ts);
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const Vec3 G3k = (60.0 * B2[k]) * g3_d3s;
+                        gCP[k] -= G3k;
+                        gCP[k + 1] += 3.0 * G3k;
+                        gCP[k + 2] -= 3.0 * G3k;
+                        gCP[k + 3] += G3k;
+                    }
+
+                    gT[s] += dyn_constr_thrust_weight_ * (wj / (double)kappa) * pena;
+                    gT[s] += -5.0 * totalVel.dot(d1s) / (Ts * Ts);
+                    gT[s] += -40.0 * totalAcc.dot(d2s) / std::pow(Ts, 3);
+                    gT[s] += -180.0 * totalJer.dot(d3s) / std::pow(Ts, 4);
+                }
+            }
+
+        } // end samples
+
+        // push gCP -> (P,V,A) for this segment and explicit CP(T) terms
+        const double Ts2 = Ts * Ts;
+        gP[s] += gCP[0] + gCP[1] + gCP[2];
+        gV[s] += (Ts / 5.0) * gCP[1] + (2.0 * Ts / 5.0) * gCP[2];
+        gA[s] += (Ts2 / 20.0) * gCP[2];
+
+        gP[s + 1] += gCP[3] + gCP[4] + gCP[5];
+        gV[s + 1] += (-2.0 * Ts / 5.0) * gCP[3] + (-Ts / 5.0) * gCP[4];
+        gA[s + 1] += (Ts2 / 20.0) * gCP[3];
+
+        // ∂J/∂T via CP(T) dependence
+        gT[s] += gCP[1].dot(V[s] / 5.0);
+        gT[s] += gCP[2].dot((2.0 / 5.0) * V[s] + (Ts / 10.0) * A[s]);
+        gT[s] += gCP[3].dot((-2.0 / 5.0) * V[s + 1] + (Ts / 10.0) * A[s + 1]);
+        gT[s] += gCP[4].dot((-1.0 / 5.0) * V[s + 1]);
+    }
+
+    // (a) scatter (P,V,A) -> z=[p, v̂, â, τ] with T̄-decoding
+    std::vector<double> Tbar;
+    build_Tbar(T, Tbar);
+    auto vhat_i = [&](int i)
+    { return Vec3(z[9 * i + 3], z[9 * i + 4], z[9 * i + 5]); };
+    auto ahat_i = [&](int i)
+    { return Vec3(z[9 * i + 6], z[9 * i + 7], z[9 * i + 8]); };
+
+    std::vector<double> gTbar(knots, 0.0);
+    for (int i = 0; i < knots; ++i)
+    {
+        const int base = 9 * i;
+        const double Tb = std::max(1e-12, Tbar[i]);
+
+        grad.segment<3>(base + 0) += gP[i];
+        grad.segment<3>(base + 3) += (1.0 / Tb) * gV[i];
+        grad.segment<3>(base + 6) += (1.0 / (Tb * Tb)) * gA[i];
+
+        gTbar[i] += -gV[i].dot(vhat_i(i)) / (Tb * Tb) - 2.0 * gA[i].dot(ahat_i(i)) / (Tb * Tb * Tb);
+    }
+
+    // (b) distribute decode extras to segments and add to gT
+    std::vector<double> gTextra(M, 0.0);
+    distribute_gTbar_to_segments(gTbar, gTextra);
+    for (int s = 0; s < M; ++s)
+        gT[s] += gTextra[s];
+
+    // (c) chain to τ via dT/dτ and accumulate into z
+    for (int s = 0; s < M; ++s)
+    {
+        const double dTdtau = dT_dtau(z[K_cp_ + s]);
+        grad[K_cp_ + s] += gT[s] * dTdtau;
     }
 }
 
@@ -2115,307 +2861,6 @@ void SolverLBFGS::dJ_acc_constr_dz(const VecXd &z,
     {
         grad[K_cp_ + s] += gT[s] * T[s];
     }
-}
-
-// -----------------------------------------------------------------------------
-
-void SolverLBFGS::dJ_thrust_max_dz(const VecXd &z,
-                                   const std::vector<Vec3> &P,
-                                   const std::vector<Vec3> &V,
-                                   const std::vector<Vec3> &A,
-                                   const std::vector<std::array<Vec3, 6>> &CP,
-                                   const std::vector<double> &T,
-                                   VecXd &grad) const
-{
-    const double eps = 1e-12;
-    const Vec3 e3(0, 0, 1);
-    const double g = g_;
-
-    // accumulators
-    std::vector<Vec3> gP(M_ + 1, Vec3::Zero());
-    std::vector<Vec3> gV(M_ + 1, Vec3::Zero());
-    std::vector<Vec3> gA(M_ + 1, Vec3::Zero());
-    std::vector<double> gT(M_, 0.0);
-
-    for (int s = 0; s < M_; ++s)
-    {
-        const double Ts = T[s];
-        if (Ts <= 0.0)
-            continue;
-
-        const double invT = 1.0 / (Ts + 1e-16);
-        const double beta = 20.0 * invT * invT; // 20/T^2
-        const double dbeta_dT = -40.0 / (std::pow(Ts, 3) + 1e-16);
-
-        std::array<Vec3, 6> gCP_s;
-        for (auto &gcp : gCP_s)
-            gcp.setZero();
-
-        for (int j = 0; j <= 3; ++j)
-        {
-            const Vec3 d2 = CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j];
-            const Vec3 W = beta * d2;
-            const Vec3 Wt = W + g * e3;
-
-            const double n = std::sqrt(Wt.squaredNorm() + eps * eps);
-            const double viol = n - thrust_max_;
-            if (viol <= 0.0)
-                continue;
-
-            // dJ/dWt = 3*viol^2 * Wt / n
-            const Vec3 gWt = (3.0 * viol * viol / n) * Wt;
-
-            // chain: W = beta * d2
-            gCP_s[j] += beta * gWt;
-            gCP_s[j + 1] += -2.0 * beta * gWt;
-            gCP_s[j + 2] += beta * gWt;
-
-            // direct dJ/dT through beta(T)
-            const Vec3 dW_dT = dbeta_dT * d2;
-            gT[s] += gWt.dot(dW_dT);
-        }
-
-        // push to (P,V,A,T) through Hermite→Bézier map
-        accumulate_cp_to_pvaT(s, gCP_s, V, A, T, gP, gV, gA, gT);
-    }
-
-    // scatter to z
-    for (int i = 0; i <= M_; ++i)
-    {
-        const int base = 9 * i;
-        grad.segment<3>(base + 0) += gP[i];
-        grad.segment<3>(base + 3) += gV[i];
-        grad.segment<3>(base + 6) += gA[i];
-    }
-    for (int s = 0; s < M_; ++s)
-        grad[K_cp_ + s] += gT[s] * T[s];
-}
-
-// -----------------------------------------------------------------------------
-
-void SolverLBFGS::dJ_thrust_min_dz(const VecXd &z,
-                                   const std::vector<Vec3> &P,
-                                   const std::vector<Vec3> &V,
-                                   const std::vector<Vec3> &A,
-                                   const std::vector<std::array<Vec3, 6>> &CP,
-                                   const std::vector<double> &T,
-                                   VecXd &grad) const
-{
-    const Vec3 e3(0, 0, 1);
-    const double g = g_;
-
-    std::vector<Vec3> gP(M_ + 1, Vec3::Zero());
-    std::vector<Vec3> gV(M_ + 1, Vec3::Zero());
-    std::vector<Vec3> gA(M_ + 1, Vec3::Zero());
-    std::vector<double> gT(M_, 0.0);
-
-    for (int s = 0; s < M_; ++s)
-    {
-        const double Ts = T[s];
-        if (Ts <= 0.0)
-            continue;
-
-        const double invT = 1.0 / (Ts + 1e-16);
-        const double beta = 20.0 * invT * invT;
-        const double dbeta_dT = -40.0 / (std::pow(Ts, 3) + 1e-16);
-
-        std::array<Vec3, 6> gCP_s;
-        for (auto &gcp : gCP_s)
-            gcp.setZero();
-
-        for (int j = 0; j <= 3; ++j)
-        {
-            const Vec3 d2 = CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j];
-            const Vec3 W = beta * d2;
-            const double Wt_z = W.z() + g;
-
-            const double viol = thrust_min_ - Wt_z;
-            if (viol <= 0.0)
-                continue;
-
-            // dJ/dWt_z = -3 * viol^2
-            const Vec3 gWt(0.0, 0.0, -3.0 * viol * viol);
-
-            // chain via W = beta * d2
-            gCP_s[j] += beta * gWt;
-            gCP_s[j + 1] += -2.0 * beta * gWt;
-            gCP_s[j + 2] += beta * gWt;
-
-            const Vec3 dW_dT = dbeta_dT * d2;
-            gT[s] += gWt.dot(dW_dT);
-        }
-
-        accumulate_cp_to_pvaT(s, gCP_s, V, A, T, gP, gV, gA, gT);
-    }
-
-    for (int i = 0; i <= M_; ++i)
-    {
-        const int base = 9 * i;
-        grad.segment<3>(base + 0) += gP[i];
-        grad.segment<3>(base + 3) += gV[i];
-        grad.segment<3>(base + 6) += gA[i];
-    }
-    for (int s = 0; s < M_; ++s)
-        grad[K_cp_ + s] += gT[s] * T[s];
-}
-
-// -----------------------------------------------------------------------------
-
-void SolverLBFGS::dJ_theta_dz(const VecXd &z,
-                              const std::vector<Vec3> &P,
-                              const std::vector<Vec3> &V,
-                              const std::vector<Vec3> &A,
-                              const std::vector<std::array<Vec3, 6>> &CP,
-                              const std::vector<double> &T,
-                              VecXd &grad) const
-{
-    const double eps = 1e-12;
-    const Vec3 e3(0, 0, 1);
-    const double g = g_;
-
-    std::vector<Vec3> gP(M_ + 1, Vec3::Zero());
-    std::vector<Vec3> gV(M_ + 1, Vec3::Zero());
-    std::vector<Vec3> gA(M_ + 1, Vec3::Zero());
-    std::vector<double> gT(M_, 0.0);
-
-    for (int s = 0; s < M_; ++s)
-    {
-        const double Ts = T[s];
-        if (Ts <= 0.0)
-            continue;
-
-        const double invT = 1.0 / (Ts + 1e-16);
-        const double beta = 20.0 * invT * invT;
-        const double dbeta_dT = -40.0 / (std::pow(Ts, 3) + 1e-16);
-
-        std::array<Vec3, 6> gCP_s;
-        for (auto &gcp : gCP_s)
-            gcp.setZero();
-
-        for (int j = 0; j <= 3; ++j)
-        {
-            const Vec3 d2 = CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j];
-            const Vec3 W = beta * d2;
-            const Vec3 Wt = W + g * e3;
-            const double tan_theta_max_ = std::tan(theta_max_);
-            const double nxy = std::sqrt(Wt.x() * Wt.x() + Wt.y() * Wt.y() + eps * eps);
-            const double viol = nxy - tan_theta_max_ * Wt.z();
-            if (viol <= 0.0)
-                continue;
-
-            // dJ/dWt = 3*viol^2 * [ Wx/nxy, Wy/nxy, -tan(theta_max) ]
-            Vec3 gWt(Wt.x() / nxy, Wt.y() / nxy, -tan_theta_max_);
-            gWt *= (3.0 * viol * viol);
-
-            // chain via W = beta * d2
-            gCP_s[j] += beta * gWt;
-            gCP_s[j + 1] += -2.0 * beta * gWt;
-            gCP_s[j + 2] += beta * gWt;
-
-            const Vec3 dW_dT = dbeta_dT * d2;
-            gT[s] += gWt.dot(dW_dT);
-        }
-
-        accumulate_cp_to_pvaT(s, gCP_s, V, A, T, gP, gV, gA, gT);
-    }
-
-    for (int i = 0; i <= M_; ++i)
-    {
-        const int base = 9 * i;
-        grad.segment<3>(base + 0) += gP[i];
-        grad.segment<3>(base + 3) += gV[i];
-        grad.segment<3>(base + 6) += gA[i];
-    }
-    for (int s = 0; s < M_; ++s)
-        grad[K_cp_ + s] += gT[s] * T[s];
-}
-
-// -----------------------------------------------------------------------------
-
-void SolverLBFGS::dJ_omega_dz(const VecXd &z,
-                              const std::vector<Vec3> &P,
-                              const std::vector<Vec3> &V,
-                              const std::vector<Vec3> &A,
-                              const std::vector<std::array<Vec3, 6>> &CP,
-                              const std::vector<double> &T,
-                              VecXd &grad) const
-{
-    const double eps = 1e-12;
-    const Vec3 e3(0, 0, 1);
-    const double g = g_;
-
-    std::vector<Vec3> gP(M_ + 1, Vec3::Zero());
-    std::vector<Vec3> gV(M_ + 1, Vec3::Zero());
-    std::vector<Vec3> gA(M_ + 1, Vec3::Zero());
-    std::vector<double> gT(M_, 0.0);
-
-    for (int s = 0; s < M_; ++s)
-    {
-        const double Ts = T[s];
-        if (Ts <= 0.0)
-            continue;
-
-        const double invT = 1.0 / (Ts + 1e-16);
-        const double beta = 20.0 * invT * invT; // accel scale
-        const double dbeta_dT = -40.0 / (std::pow(Ts, 3) + 1e-16);
-        const double gamma = 60.0 * invT * invT * invT; // jerk  scale
-        const double dgamma_dT = -180.0 / (std::pow(Ts, 4) + 1e-16);
-
-        std::array<Vec3, 6> gCP_s;
-        for (auto &gcp : gCP_s)
-            gcp.setZero();
-
-        for (int j = 0; j <= 2; ++j)
-        {
-            // Jerk CP (quad) at j
-            const Vec3 d3 = CP[s][j + 3] - 3.0 * CP[s][j + 2] + 3.0 * CP[s][j + 1] - CP[s][j];
-            const Vec3 Jv = gamma * d3;
-            const double nJ = std::sqrt(Jv.squaredNorm() + eps * eps);
-
-            // vertical thrust at same j from accel CPs
-            const Vec3 d2 = CP[s][j + 2] - 2.0 * CP[s][j + 1] + CP[s][j];
-            const Vec3 W = beta * d2;
-            const double Wt_z = W.z() + g;
-
-            const double viol = nJ - omega_max_ * Wt_z;
-            if (viol <= 0.0)
-                continue;
-
-            // part 1: through J
-            const Vec3 gJ = (3.0 * viol * viol / nJ) * Jv; // dJ/dJv
-
-            // chain to CP via J = gamma * d3  (coeffs [-1,3,-3,1])
-            gCP_s[j] += -gamma * gJ;
-            gCP_s[j + 1] += 3.0 * gamma * gJ;
-            gCP_s[j + 2] += -3.0 * gamma * gJ;
-            gCP_s[j + 3] += gamma * gJ;
-
-            // direct d/dT via gamma(T)
-            gT[s] += gJ.dot(dgamma_dT * d3);
-
-            // part 2: through Wt_z term (−ω_max * Wt_z)
-            const Vec3 gWt(0.0, 0.0, -omega_max_ * 3.0 * viol * viol);
-
-            // chain via W = beta * d2  (uses j..j+2)
-            gCP_s[j] += beta * gWt;
-            gCP_s[j + 1] += -2.0 * beta * gWt;
-            gCP_s[j + 2] += beta * gWt;
-
-            gT[s] += gWt.dot(dbeta_dT * d2); // direct T via beta(T)
-        }
-
-        accumulate_cp_to_pvaT(s, gCP_s, V, A, T, gP, gV, gA, gT);
-    }
-
-    for (int i = 0; i <= M_; ++i)
-    {
-        const int base = 9 * i;
-        grad.segment<3>(base + 0) += gP[i];
-        grad.segment<3>(base + 3) += gV[i];
-        grad.segment<3>(base + 6) += gA[i];
-    }
-    for (int s = 0; s < M_; ++s)
-        grad[K_cp_ + s] += gT[s] * T[s];
 }
 
 // -----------------------------------------------------------------------------
