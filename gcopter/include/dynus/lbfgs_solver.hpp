@@ -47,6 +47,11 @@ namespace lbfgs
                                  Eigen::VectorXd>;
     // one block per segment‐pair:
     using ConstraintBlocks = std::vector<std::vector<PlaneBlock>>;
+    // H-polyhedron: rows are [n_x n_y n_z d] meaning n^T x <= d
+    using PolyhedronH = Eigen::Matrix<double, Eigen::Dynamic, 4>;
+    using PolyhedronV = Eigen::Matrix3Xd;
+    using PolyhedraH = std::vector<PolyhedronH>;
+    using PolyhedraV = std::vector<PolyhedronV>;
 
     struct planner_params_t
     {
@@ -103,35 +108,9 @@ namespace lbfgs
 
         void pushWaypointsByStaticCorridor(std::vector<Vec3> &wps);
         void getGlobalPath(vec_Vecf<3> &global_path);
+        // Computes objective and gradient in one call, reusing a single reconstruct.
+        double evaluateObjectiveAndGradientFused(const Eigen::VectorXd& z, Eigen::VectorXd& grad);
 
-        // -----------------------------------------------------------------------------
-        /**
-         * @brief Build a collection of initial‐guess vectors z₀ (and the
-         *        corresponding control‐points & times) by sampling
-         *        systematic perturbations of a “global” waypoint list.
-         *
-         * @param global_wps       Base waypoints (size M+1)
-         * @param joint_indices    Which indices to perturb
-         * @param r_max            Perturbation radius
-         * @param constraint_sets  For each joint, list of (A_row,b) enforcing A·pt>b
-         * @param[out] list_z0     Packed [freeCPs; sigmas] for each waypoint set
-         * @param[out] list_cp0    Full reconstructed CP arrays for each z₀
-         * @param[out] list_t0     Reconstructed segment‐time vectors for each z₀
-         */
-        void buildInitialGuesses(const ConstraintBlocks &constraint_sets);
-
-        // -----------------------------------------------------------------------------
-
-        /**
-         * @brief Systematically perturb joint waypoints in 3D by sampling
-         *        eight equally spaced directions in the bisector plane.
-         *
-         * @param constraint_sets  For each joint, list of (A_row,b) pairs enforcing A_row·pt > b
-         * @param[out] samples     Output array of waypoint sets (each size K)
-         */
-        std::vector<std::vector<Vec3>>
-        sample_systematic_perturbed_waypoints(
-            const ConstraintBlocks &constraint_sets) const;
 
         // -----------------------------------------------------------------------------
 
@@ -154,18 +133,6 @@ namespace lbfgs
         void computeAnalyticalGrad(
             const Eigen::VectorXd &z,
             Eigen::VectorXd &grad);
-
-        // -----------------------------------------------------------------------------
-
-        /**
-         * @brief Callback for L-BFGS: evaluate cost & analytic gradient in one shot.
-         *
-         * @param z Current decision variables
-         * @param g Output gradient
-         * @return cost = J(z)
-         */
-        double evaluateObjectiveAndGradient(const Eigen::VectorXd &z,
-                                            Eigen::VectorXd &g);
 
         // -----------------------------------------------------------------------------
 
@@ -249,11 +216,14 @@ namespace lbfgs
          * @param z   (output) decision vector, length = 9*(M_+1) + M_
          */
         void packDecisionVariables(
+            const Eigen::VectorXd &xi,
             const std::vector<Vec3> &P,
             const std::vector<Vec3> &V,
             const std::vector<Vec3> &A,
             const std::vector<double> &T,
             VecXd &z) const;
+
+        bool encodeSeamQFromPoint(int seam, const Eigen::Vector3d &p, Eigen::VectorXd &q) const;
 
         // -----------------------------------------------------------------------------
 
@@ -270,6 +240,8 @@ namespace lbfgs
          */
         void sanityCheck() const;
 
+        void seedSeamQsToCorners(Eigen::VectorXd &z) const;
+
         /**
          * @brief initialize the solver with default parameters.
          */
@@ -281,11 +253,30 @@ namespace lbfgs
         void prepareSolverForReplan(double t0,
                                     const vec_Vec3f &global_wps,
                                     const std::vector<LinearConstraint3D> &safe_corridor,
+                                    const Eigen::VectorXd &initial_xi,
                                     const std::vector<std::shared_ptr<dynTraj>> &obstacles,
                                     const state &initial_state,
                                     const state &goal_state,
                                     double &initial_guess_computation_time,
+                                    const PolyhedraV &vPolys,
                                     bool use_multiple_initial_guesses = true);
+
+        bool extractSeamQFromInitialXi(
+            const Eigen::VectorXd &initial_xi,
+            std::vector<Eigen::VectorXd> &q_seams) const;
+
+        double centralDiff(const VecXd &z,
+                           const VecXd &d,
+                           double eps_base);
+
+        void projectDirectionToFreeVars(Eigen::VectorXd& d) const;
+
+        void checkGradDirectional(const VecXd &z0,
+                                  int num_dirs /*=8*/,
+                                  double eps /*=1e-6*/,
+                                  unsigned seed /*=0*/);
+
+        void checkGradCoordinates(const VecXd &z0, int max_coords, double eps, unsigned seed);
 
         /**
          * @brief Set the initial guess waypoints for the trajectory.
@@ -351,11 +342,6 @@ namespace lbfgs
          * @brief
          */
         void getPieceWisePol(PieceWiseQuinticPol &pwp);
-
-        /**
-         *
-         */
-        void getControlPoints(std::vector<Eigen::Matrix<double, 3, 6>> &cps);
 
         /**
          *
@@ -436,46 +422,6 @@ namespace lbfgs
         // -----------------------------------------------------------------------------
 
         /**
-         * @brief Analytic gradient of the dynamic‐obstacle cost at knot times.
-         *
-         * Cost: J_dyn = ∑_obs ∑_{i=1..M-1} [max( Cw² – ‖E·(P_i–K_i)‖², 0)]³
-         *
-         * @param z     Decision vector [p₀,v₀,a₀,…,p_M,v_M,a_M, σ₀…σ_{M-1}]
-         * @param P     Knot positions (size M+1).
-         * @param T     Segment durations (size M).
-         * @param grad  (output) gradient ∇_z J_dyn, same size as z
-         */
-        void dJ_dyn_dz(const VecXd &z,
-                       const std::vector<Vec3> &P,
-                       const std::vector<Vec3> &V,
-                       const std::vector<Vec3> &A,
-                       const std::vector<std::array<Vec3, 6>> &CP,
-                       const std::vector<double> &T,
-                       VecXd &grad) const;
-
-        // -----------------------------------------------------------------------------
-
-        /**
-         * @brief Analytical gradient of the static‐barrier cost
-         *   J_stat = ∑_{s=0..M-1} ∑_{j∈relevant(s)} −log( A_stat[s]·P[s,j] − b_stat[s] )
-         *   w.r.t. decision vector z = [free CPs; slack times].
-         *
-         * @param CP         Bezier control points, M segments each with 6×3 points.
-         * @param P     Knot positions (size M+1).
-         * @param T     Segment durations (size M).
-         * @param grad  (output) gradient ∇_z J_stat, same size as z
-         */
-        void dJ_stat_dz(const VecXd &z,
-                        const std::vector<Vec3> &P,
-                        const std::vector<Vec3> &V,
-                        const std::vector<Vec3> &A,
-                        const std::vector<std::array<Vec3, 6>> &CP,
-                        const std::vector<double> &T,
-                        VecXd &grad) const;
-
-        // -----------------------------------------------------------------------------
-
-        /**
          * @brief Analytical gradient of the jerk penalty
          *        J_jerk = ∑ₛ (3600/Tₛ⁵) ∑_{m=0..2} ‖Δ³P[s,m]‖²
          * w.r.t. z = [free CPs; slack times].
@@ -500,137 +446,11 @@ namespace lbfgs
 
         // -----------------------------------------------------------------------------
 
-        /**
-         * @brief Analytical gradient of the velocity‐constraint violation cost
-         *        J_vel = dyn_constr_vel_weight * ∑_{s=0..M-1} ∑_{j=0..4}
-         *                [ max(‖V_{s,j}‖ - V_max, 0) ]^2
-         *        where V_{s,j} = (5/T[s]) (P[s][j+1] - P[s][j]).
-         *
-         * @param z   Decision variables (free CPs; slack times).
-         * @return    ∇_z J_vel as a length-|z| vector.
-         */
-        void dJ_vel_constr_dz(const VecXd &z,
-                              const std::vector<Vec3> &P,
-                              const std::vector<Vec3> &V,
-                              const std::vector<Vec3> &A,
-                              const std::vector<std::array<Vec3, 6>> &CP,
-                              const std::vector<double> &T,
-                              VecXd &grad) const;
+        void seamBackward(int i, const Eigen::VectorXd &q, const Eigen::Vector3d &gp, Eigen::VectorXd &gq) const; // accumulate into ∂J/∂q
 
-        // -----------------------------------------------------------------------------
-
-        /**
-         * @brief Analytical gradient of the acceleration‐constraint violation cost
-         *        J_acc = dyn_constr_acc_weight * ∑_{s=0..M-1} ∑_{j=0..3}
-         *                [ max(‖A_{s,j}‖ - A_max, 0) ]^2
-         *        where A_{s,j} = (20/T[s]^2) (P[s][j+2] - 2P[s][j+1] + P[s][j]).
-         *
-         * @param z   Decision variables (free CPs; slack times).
-         * @return    ∇_z J_acc as a length-|z| vector.
-         */
-        void dJ_acc_constr_dz(const VecXd &z,
-                              const std::vector<Vec3> &P,
-                              const std::vector<Vec3> &V,
-                              const std::vector<Vec3> &A,
-                              const std::vector<std::array<Vec3, 6>> &CP,
-                              const std::vector<double> &T,
-                              VecXd &grad) const;
-
-        // -----------------------------------------------------------------------------
-
-    private:
-        /// Find which segment index s contains time t_i
-        int findSegment(double ti, const std::vector<double> &T) const;
-
-        /// Evaluate Bernstein basis (degree=5) and derivative at tau
-        void evalBernstein5(double tau, double B[6], double dB[6]) const;
-
-        /**
-         * @brief Evaluate one trajectory sample u_i and its segment/tau.
-         *
-         * @param CP           full control–point array [M][6]
-         * @param T            segment durations (size M)
-         * @param sample_i     index i in [0..num_samples-1]
-         * @param num_samples total number of samples
-         * @param[out] seg    segment index containing sample i
-         * @param[out] tau    normalized time in [0,1] within that segment
-         * @param[out] t0     absolute start time of that segment
-         * @return            u_i position in ℝ³
-         */
-        Eigen::Vector3d evalSample(
-            const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
-            const std::vector<double> &T,
-            int sample_i,
-            int num_samples,
-            int &seg,
-            double &tau,
-            double &t0) const;
-
-        /// Evaluate obstacle position at time t
-        Eigen::Vector3d evalObs(const Eigen::Matrix<double, 6, 1> &cx,
-                                const Eigen::Matrix<double, 6, 1> &cy,
-                                const Eigen::Matrix<double, 6, 1> &cz,
-                                double t) const;
-
-        /**
-         * Build a small Jacobian ∂u_i/∂z for one sample:
-         *   - only the free‐CP columns in segment s (3 per cp)
-         *   - plus the two slack columns σ_s and σ_{s+1}
-         */
-        // in lbfgs_solver.hpp, under your class SolverLBFGS
-        void buildSparseDuDzSample(
-            const Eigen::VectorXd &z,
-            const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
-            const std::vector<double> &T,
-            int sample_i,
-            int num_samples,
-            int seg,
-            double tau,
-            const std::vector<std::vector<Eigen::Matrix<double, 3, Eigen::Dynamic>>> &dPdz,
-            const Eigen::MatrixXd &dTdz,
-            std::vector<int> &cols,
-            Eigen::MatrixXd &Jsmall) const;
-
-        /**
-         * Build a small Jacobian ∂k_i/∂z for one sample:
-         *   - only the M slack columns (but will be the same α factor for each)
-         */
-        void buildSparseDkDzSample(
-            const Eigen::VectorXd &z,
-            const std::vector<double> &T,
-            int sample_i,
-            int num_samples,
-            const Eigen::Matrix<double, 6, 1> &cx,
-            const Eigen::Matrix<double, 6, 1> &cy,
-            const Eigen::Matrix<double, 6, 1> &cz,
-            std::vector<int> &cols,
-            Eigen::MatrixXd &Ksmall) const;
-
-        void buildSparseDkDzSample(
-            const Eigen::VectorXd &z,
-            const std::vector<double> &T,
-            int sample_i,
-            int num_samples,
-            const PieceWisePol &pw,
-            std::vector<int> &cols,
-            Eigen::MatrixXd &Ksmall) const;
-
-        // -----------------------------------------------------------------------------
-        // Helper functions for ROS
-        // -----------------------------------------------------------------------------
-
-        inline int nCk5(int n, int k)
-        {
-            // Pascal’s triangle up to row 5
-            static constexpr int C[6][6] = {
-                {1, 0, 0, 0, 0, 0},
-                {1, 1, 0, 0, 0, 0},
-                {1, 2, 1, 0, 0, 0},
-                {1, 3, 3, 1, 0, 0},
-                {1, 4, 6, 4, 1, 0},
-                {1, 5, 10, 10, 5, 1}};
-            return C[n][k];
-        }
+        void scatterPosGrads(const std::vector<Eigen::Vector3d> &gP,
+                             const Eigen::VectorXd &z,
+                             Eigen::VectorXd &grad) const;
 
     protected:
         // ------------------------------
@@ -738,6 +558,54 @@ namespace lbfgs
         std::vector<double> T_opt_;
         std::vector<Vec3> P_opt_, V_opt_, A_opt_;
         double t0_{0.0}; // start time of the trajectory
+
+        // >>> add to SolverLBFGS class (private:)
+        PolyhedraV vPolys_OB_;         // [poly0, inter01, poly1, inter12, ..., polyM]
+        Eigen::VectorXi seamSizes_;    // k_i = vPolys_OB_[2*i-1].cols() for i=1..M-1 (intersections)
+        std::vector<int> seamOffsets_; // offsets in z for each q-block
+
+        // z layout offsets (computed per problem)
+        int offP0_ = 0;   // 3 doubles
+        int offXi_ = 0;   // start of all q blocks
+        int offPM_ = 0;   // 3 doubles
+        int offVhat_ = 0; // 3*(M+1)
+        int offAhat_ = 0; // 3*(M+1)
+        int offTau_ = 0;  // M
+
+        // --- layout state ---
+        bool corridor_q_active_ = true; // true when we use [P0 | q's | PM | v̂ | â | τ]
+
+        inline bool useCorridorLayout() const { return corridor_q_active_; }
+
+        // Accessors that work in BOTH layouts
+        inline Eigen::Vector3d getVhat(const Eigen::VectorXd &z, int i) const
+        {
+            if (useCorridorLayout())
+                return z.segment<3>(offVhat_ + 3 * i);
+            const int base = 9 * i;
+            return {z[base + 3], z[base + 4], z[base + 5]};
+        }
+        inline Eigen::Vector3d getAhat(const Eigen::VectorXd &z, int i) const
+        {
+            if (useCorridorLayout())
+                return z.segment<3>(offAhat_ + 3 * i);
+            const int base = 9 * i;
+            return {z[base + 6], z[base + 7], z[base + 8]};
+        }
+        inline void accumVhatGrad(int i, const Eigen::Vector3d &g, Eigen::VectorXd &grad) const
+        {
+            if (useCorridorLayout())
+                grad.segment<3>(offVhat_ + 3 * i) += g;
+            else
+                grad.segment<3>(9 * i + 3) += g;
+        }
+        inline void accumAhatGrad(int i, const Eigen::Vector3d &g, Eigen::VectorXd &grad) const
+        {
+            if (useCorridorLayout())
+                grad.segment<3>(offAhat_ + 3 * i) += g;
+            else
+                grad.segment<3>(9 * i + 6) += g;
+        }
 
     }; // class SolverLBFGS
 

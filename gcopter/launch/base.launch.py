@@ -1,35 +1,26 @@
 # launch/global_planning.launch.py
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from launch.substitutions import PathJoinSubstitution
 
-def generate_launch_description():
-    
+def launch_setup(context, *args, **kwargs):
+    # Resolve the launch arg value at runtime
+    use_simple = LaunchConfiguration('use_simple_case_benchmark').perform(context).lower() in ('true', '1', 'yes')
+
+    # Choose parameters
+    if use_simple:
+        x_length, y_length, map_type, fractal, road_width = 20, 20, 3, 3, 5.0
+    else:
+        x_length, y_length, map_type, fractal, road_width = 50, 50, 1, 1, 0.0
+
     rviz_config_path = PathJoinSubstitution(
         [FindPackageShare('gcopter'), 'config', 'global_planning.rviz']
     )
 
-    use_simple_case_benchmark = LaunchConfiguration('use_simple_case_benchmark', default='false')
-
-    if use_simple_case_benchmark:
-        x_length = 20
-        y_length = 20
-        type = 3
-        fractal = 3
-        road_width = 5.0
-    else:
-        x_length = 50
-        y_length = 50
-        type = 1
-        fractal = 1
-        road_width = 0.0
-
-    return LaunchDescription([
-
-        # mockamap (as you had it)
+    # Build actions with concrete Python values
+    return [
         Node(
             package='mockamap',
             executable='mockamap_node',
@@ -42,7 +33,7 @@ def generate_launch_description():
                 'x_length': x_length,
                 'y_length': y_length,
                 'z_length': 5,
-                'type': type,
+                'type': map_type,
                 'complexity': 0.025,
                 'fill': 0.3,
                 'fractal': fractal,
@@ -51,8 +42,6 @@ def generate_launch_description():
             }],
             remappings=[('/mock_map', '/voxel_map')],
         ),
-
-        # optional: rviz2
         Node(
             package='rviz2',
             executable='rviz2',
@@ -60,4 +49,15 @@ def generate_launch_description():
             output='screen',
             arguments=['-d', rviz_config_path],
         ),
+    ]
+
+def generate_launch_description():
+    return LaunchDescription([
+        DeclareLaunchArgument(
+            'use_simple_case_benchmark',
+            default_value='false',
+            choices=['true', 'false'],
+            description='Use smaller simple map with wider roads.'
+        ),
+        OpaqueFunction(function=launch_setup),
     ])

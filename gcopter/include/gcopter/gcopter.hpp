@@ -48,6 +48,7 @@ namespace gcopter
         typedef std::vector<PolyhedronH> PolyhedraH;
         Eigen::Matrix3Xd initial_guess_points_;
         Eigen::VectorXd initial_guess_times_;
+        Eigen::VectorXd initial_xi_;
         double computation_time_ms_;
 
     private:
@@ -591,7 +592,7 @@ namespace gcopter
             return cost;
         }
 
-        static inline void getShortestPath(const Eigen::Vector3d &ini,
+        inline void getShortestPath(const Eigen::Vector3d &ini,
                                            const Eigen::Vector3d &fin,
                                            const PolyhedraV &vPolys,
                                            const double &smoothD,
@@ -628,6 +629,9 @@ namespace gcopter
                                   nullptr,
                                   dataPtrs,
                                   shortest_path_params);
+
+            // initialize initial_xi_
+            initial_xi_ = xi;
 
             path.resize(3, overlaps + 2);
             path.leftCols<1>() = ini;
@@ -811,6 +815,11 @@ namespace gcopter
             return true;
         }
 
+        inline void getVPolytopes(PolyhedraV &vPs) const
+        {
+            vPs = vPolytopes;
+        }
+
         inline double optimize(Trajectory<5> &traj,
                                const double &relCostTol)
         {
@@ -826,7 +835,7 @@ namespace gcopter
             lbfgs_params.mem_size = 256;
             lbfgs_params.past = 3;
             lbfgs_params.min_step = 1.0e-32;
-            lbfgs_params.max_iterations = 100;
+            lbfgs_params.max_iterations = 300;
             lbfgs_params.g_epsilon = 1e-5;
             lbfgs_params.delta = relCostTol;
 
@@ -873,10 +882,12 @@ namespace gcopter
         }
 
         void getInitialGuess(Eigen::Matrix3Xd &points,
-                                     Eigen::VectorXd &times) const
+                             Eigen::VectorXd &times,
+                             Eigen::VectorXd &xi) const
         {
             points = initial_guess_points_;
             times = initial_guess_times_;
+            xi = initial_xi_;
         }
     };
 

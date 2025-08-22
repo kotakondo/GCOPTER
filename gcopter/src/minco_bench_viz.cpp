@@ -40,6 +40,8 @@ namespace fs = std::filesystem;
 using lbfgs::planner_params_t;
 using lbfgs::SolverLBFGS;
 using lbfgs::Vec3;
+using PolyhedronV = Eigen::Matrix3Xd;
+using PolyhedraV = std::vector<PolyhedronV>;
 
 struct Config
 {
@@ -79,13 +81,13 @@ struct Config
     double sampleDt; // seconds
 
     // MIGHTY-specific
-    double mightyWeightT; // w_T for MIGHTY (LBFGS)
-    double mightyPosWeight; // w_pos for MIGHTY (LBFGS)
-    double mightyVelWeight; // w_vel for MIGHTY (LBFGS)
-    double mightyOmegaWeight; // w_omega for MIGHTY (LBFGS)
-    double mightyThetaWeight; // w_theta for MIGHTY (LBFGS)
+    double mightyWeightT;      // w_T for MIGHTY (LBFGS)
+    double mightyPosWeight;    // w_pos for MIGHTY (LBFGS)
+    double mightyVelWeight;    // w_vel for MIGHTY (LBFGS)
+    double mightyOmegaWeight;  // w_omega for MIGHTY (LBFGS)
+    double mightyThetaWeight;  // w_theta for MIGHTY (LBFGS)
     double mightyThrustWeight; // w_thrust for MIGHTY (LBFGS
-    double mightyJerkWeight; // Jerk weight for MIGHTY (LBFGS
+    double mightyJerkWeight;   // Jerk weight for MIGHTY (LBFGS
     double orientSmoothWeight; // w_orient_smooth
     double tiltBiasWeight;     // w_tilt_bias
     double tvarWeight;         // w_tvar
@@ -128,19 +130,19 @@ struct Config
         node.declare_parameter("OrientSmoothWeight", 0.0); // w_orient_smooth
         node.declare_parameter("TiltBiasWeight", 0.0);     // w_tilt_bias
         node.declare_parameter("TvarWeight", 0.0);         // w_tvar
-        node.declare_parameter("TminWeight", 0.0); // w_Tmin
+        node.declare_parameter("TminWeight", 0.0);         // w_Tmin
         node.declare_parameter("TminPlan", 0.0);
         node.declare_parameter("SmoothingEps", 1.0e-2);
         node.declare_parameter("IntegralIntervs", 16);
         node.declare_parameter("RelCostTol", 1.0e-5);
         node.declare_parameter("ExportCSVDir", std::string("")); // empty => no export
         node.declare_parameter("SampleDt", 0.02);                // seconds
-        node.declare_parameter("MIGHTYWeightT", 10.0); // w_T for MIGHTY (LBFGS)
-        node.declare_parameter("MIGHTYPosWeight", 1.0e+4); // w_pos for MIGHTY (LBFGS)
-        node.declare_parameter("MIGHTYVelWeight", 1.0e+4); // w_vel for MIGHTY (LBFGS)
-        node.declare_parameter("MIGHTYOmegaWeight", 1.0e+4); // w_omega for MIGHTY (LBFGS)
-        node.declare_parameter("MIGHTYThetaWeight", 1.0e+4); // w_theta for MIGHTY (LBFGS)
-        node.declare_parameter("MIGHTYThrustWeight", 1.0e+5); // w_thrust for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYWeightT", 10.0);           // w_T for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYPosWeight", 1.0e+4);       // w_pos for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYVelWeight", 1.0e+4);       // w_vel for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYOmegaWeight", 1.0e+4);     // w_omega for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYThetaWeight", 1.0e+4);     // w_theta for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYThrustWeight", 1.0e+5);    // w_thrust for MIGHTY (LBFGS)
         node.declare_parameter("MIGHTYJerkWeight", 0.1);         // Jerk weight for MIGHTY (LBFGS)
         node.declare_parameter("CollisionDt", 0.01);
         node.declare_parameter("sfc_progress", 0.5);   // progress along the route for corridor generation
@@ -520,6 +522,8 @@ struct MightyOut
 
 static MightyOut runMighty(
     const vec_Vecf<3> &global_wps,
+    const PolyhedraV &vPolytopes,
+    const Eigen::VectorXd &initial_xi,
     const std::vector<LinearConstraint3D> &safe_corridor,
     const state &initial_state,
     const state &final_state,
@@ -538,8 +542,8 @@ static MightyOut runMighty(
 
     double t0 = 0.0, ig_ms = 0.0;
     solver->prepareSolverForReplan(
-        t0, global_wps, safe_corridor, obstacles,
-        initial_state, final_state, ig_ms, false); // :contentReference[oaicite:3]{index=3}
+        t0, global_wps, safe_corridor, initial_xi, obstacles,
+        initial_state, final_state, ig_ms, vPolytopes, false); // :contentReference[oaicite:3]{index=3}
 
     // Get the single initial guess we just built
     const std::vector<Eigen::VectorXd> &z0_list = solver->getInitialGuesses();
@@ -556,8 +560,8 @@ static MightyOut runMighty(
     lb.mem_size = 256;
     lb.past = 3;
     lb.min_step = 1.0e-32;
-    lb.max_iterations = 100;
-    lb.g_epsilon = 1e-5;        // gradient tolerance
+    lb.max_iterations = 300;
+    lb.g_epsilon = 1.0e-5;       // gradient tolerance
     lb.delta = cfg.relCostTol; // relative cost tolerance
 
     Eigen::VectorXd zopt;
@@ -758,7 +762,6 @@ public:
         sfc_gen::convexCover(route, pc, voxelMapInfl_.getOrigin(), voxelMapInfl_.getCorner(), config.sfc_progress, config.sfc_range, hPolys);
 
         sfc_gen::shortCut(hPolys);
-        printf("Route size: %zu\n and hPolys size: %zu\n", route.size(), hPolys.size());
 
         // Visualize SFC once (timer keeps them alive)
         visualizer.visualizePolytope(hPolys);
@@ -803,6 +806,10 @@ public:
             hPolysCache_ = hPolys;
         }
 
+        // Get vPolytopes
+        PolyhedraV vPolys;
+        gcopter.getVPolytopes(vPolys);
+
         // === 3) Metrics for GCOPTER
         Metrics M_gc = computeMetricsGCOPTER_sampled_dt(traj, config.sampleDt);
         M_gc.solve_ms = gc_ms;
@@ -810,35 +817,34 @@ public:
 
         // Get GCOPTER's initial guess for MIGHTY
         Eigen::Matrix3Xd init_points;
-        Eigen::VectorXd init_times;
-        gcopter.getInitialGuess(init_points, init_times);
+        Eigen::VectorXd init_times, initial_xi;
+        gcopter.getInitialGuess(init_points, init_times, initial_xi);
 
         int init_size = init_points.cols();
-        printf("init_points size: %d, hPolys size: %zu\n", init_size, hPolys.size());
 
         // === 4) Build MIGHTY params mapped from config
         planner_params_t mighty_cfg{};
-        mighty_cfg.verbose = false;
+        mighty_cfg.verbose = true;
         mighty_cfg.V_nom = config.maxVelMag;
         mighty_cfg.V_max = config.maxVelMag;
-        mighty_cfg.A_max = 0.0;                           // not used here
-        mighty_cfg.J_max = 0.0;                           // not used here
-        mighty_cfg.time_weight = config.mightyWeightT;          // you can tune this
-        mighty_cfg.dyn_weight = 0.0;                      // no moving obstacles in this bench
-        mighty_cfg.stat_weight = config.mightyPosWeight; // w_stat_pos
-        mighty_cfg.jerk_weight = config.mightyJerkWeight; // you can tune this
-        mighty_cfg.dyn_constr_vel_weight = config.mightyVelWeight; // w_dyn_constr_vel
+        mighty_cfg.A_max = 0.0;                                           // not used here
+        mighty_cfg.J_max = 0.0;                                           // not used here
+        mighty_cfg.time_weight = config.mightyWeightT;                    // you can tune this
+        mighty_cfg.dyn_weight = 0.0;                                      // no moving obstacles in this bench
+        mighty_cfg.stat_weight = config.mightyPosWeight;                  // w_stat_pos
+        mighty_cfg.jerk_weight = config.mightyJerkWeight;                 // you can tune this
+        mighty_cfg.dyn_constr_vel_weight = config.mightyVelWeight;        // w_dyn_constr_vel
         mighty_cfg.dyn_constr_bodyrate_weight = config.mightyOmegaWeight; // w_dyn_constr_bodyrate
-        mighty_cfg.dyn_constr_tilt_weight = config.mightyThetaWeight; // w_dyn_constr_tilt
-        mighty_cfg.dyn_constr_thrust_weight = config.mightyThrustWeight; // w_dyn_constr_thrust
-        mighty_cfg.orient_smooth_weight = config.orientSmoothWeight; // w_orient_smooth
-        mighty_cfg.tilt_bias_weight = config.tiltBiasWeight; // w_tilt_bias
-        mighty_cfg.tvar_weight = config.tvarWeight; // w_tvar
-        mighty_cfg.Tmin_weight = config.TminWeight; // w_Tmin
-        mighty_cfg.Tmin_plan = config.TminPlan; // Tmin for planning
+        mighty_cfg.dyn_constr_tilt_weight = config.mightyThetaWeight;     // w_dyn_constr_tilt
+        mighty_cfg.dyn_constr_thrust_weight = config.mightyThrustWeight;  // w_dyn_constr_thrust
+        mighty_cfg.orient_smooth_weight = config.orientSmoothWeight;      // w_orient_smooth
+        mighty_cfg.tilt_bias_weight = config.tiltBiasWeight;              // w_tilt_bias
+        mighty_cfg.tvar_weight = config.tvarWeight;                       // w_tvar
+        mighty_cfg.Tmin_weight = config.TminWeight;                       // w_Tmin
+        mighty_cfg.Tmin_plan = config.TminPlan;                           // Tmin for planning
         mighty_cfg.num_dyn_obst_samples = 64;
         mighty_cfg.init_turn_bf = 40.0; // degrees
-        mighty_cfg.Co = 0.05;           // corridor “soft margin”
+        mighty_cfg.Co = 0.0;           // corridor “soft margin”
         mighty_cfg.Cw = 0.40;           // dyn obstacle radius (unused here)
         mighty_cfg.BIG = 1e9;
         mighty_cfg.dc = 0.01; // sampling step for setpoints
@@ -873,15 +879,15 @@ public:
         // Build exactly-one-poly-per-segment corridor for MIGHTY
 
         // Ensure interior points lie inside both adjacent polytopes (nudged inward by 2 cm)
-        bool ok_fix = enforceRouteInsideCorridor(route_m, hPolys, /*inward_margin=*/0.02, /*max_passes=*/20);
-        if (!ok_fix)
-        {
-            RCLCPP_WARN(this->get_logger(), "Some waypoints still near/outside corridor after projection.");
-        }
+        // bool ok_fix = enforceRouteInsideCorridor(route_m, hPolys, /*inward_margin=*/0.02, /*max_passes=*/20);
+        // if (!ok_fix)
+        // {
+        //     RCLCPP_WARN(this->get_logger(), "Some waypoints still near/outside corridor after projection.");
+        // }
 
         // Convert GCOPTER’s hPolys to MIGHTY constraints
         std::vector<LinearConstraint3D> l_constraints = toLinearConstraints(hPolys);
-        MightyOut M_mighty = runMighty(route_m, l_constraints, init_state, goal_state, mighty_cfg, config, physicalParams);
+        MightyOut M_mighty = runMighty(route_m, vPolys, initial_xi, l_constraints, init_state, goal_state, mighty_cfg, config, physicalParams);
 
         // Draw MIGHTY trajectory in green, with its own namespace
         visualizer.visualizeBezier(M_mighty.CP, M_mighty.T, /*ns=*/"mighty", /*width=*/0.06,

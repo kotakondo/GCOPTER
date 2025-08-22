@@ -171,8 +171,8 @@ def main():
     ap.add_argument("--v_min", type=float, default=1.0)
     ap.add_argument("--v_max", type=float, default=10.0)
     ap.add_argument("--v_step", type=float, default=1.0)
-    ap.add_argument("--jerk_dec_min", type=int, default=-3)
-    ap.add_argument("--jerk_dec_max", type=int, default=3)
+    ap.add_argument("--jerk_dec_min", type=int, default=-5)
+    ap.add_argument("--jerk_dec_max", type=int, default=1)
 
     # perimeter goals
     ap.add_argument("--x_min", type=float, default=-30.0)

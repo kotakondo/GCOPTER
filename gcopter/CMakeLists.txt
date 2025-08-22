@@ -55,23 +55,15 @@ install(DIRECTORY
 
 # Executable
 add_executable(global_planning_node src/global_planning.cpp)
-
-target_link_libraries(global_planning_node
-  gcopter
+target_link_libraries(global_planning_node gcopter)
+ament_target_dependencies(global_planning_node
+  rclcpp
+  std_msgs
+  geometry_msgs
+  sensor_msgs
+  visualization_msgs
+  decomp_rviz_plugins
 )
-
-# Benchmarking
-# add_executable(benchmark src/benchmark.cpp)
-# target_link_libraries(benchmark gcopter ${OMPL_LIBRARIES})
-# ament_target_dependencies(benchmark
-#   rclcpp
-#   std_msgs
-#   geometry_msgs
-#   sensor_msgs
-#   visualization_msgs
-#   decomp_ros_msgs
-#   decomp_rviz_plugins
-# )
 
 add_executable(minco_bench_viz src/minco_bench_viz.cpp src/mighty_solver.cpp src/lbfgs_solver_utils.cpp)
 target_link_libraries(minco_bench_viz gcopter ${OMPL_LIBRARIES})
@@ -82,15 +74,6 @@ ament_target_dependencies(minco_bench_viz
   decomp_ros_msgs
   decomp_rviz_plugins
   geometry_msgs
-)
-
-ament_target_dependencies(global_planning_node
-  rclcpp
-  std_msgs
-  geometry_msgs
-  sensor_msgs
-  visualization_msgs
-  decomp_rviz_plugins
 )
 
 # Install targets
