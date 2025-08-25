@@ -234,6 +234,13 @@ namespace voxel_map
             }
         }
 
+        inline bool inMap(const Eigen::Vector3d &pos) const
+        {
+            const Eigen::Vector3i id = ((pos - o) / scale).cast<int>();
+            return (id(0) >= 0 && id(1) >= 0 && id(2) >= 0 &&
+                    id(0) < mapSize(0) && id(1) < mapSize(1) && id(2) < mapSize(2));
+        }
+
         inline Eigen::Vector3d posI2D(const Eigen::Vector3i &id) const
         {
             return id.cast<double>() * scale + oc;

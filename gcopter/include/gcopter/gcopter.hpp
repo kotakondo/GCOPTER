@@ -91,7 +91,78 @@ namespace gcopter
 
         std::vector<Eigen::MatrixX4d> piece_corridor_;
 
+        // --- Wall-clock time budget control ---
+        mutable bool time_budget_enabled_ = false;
+        mutable double time_budget_ms_ = 0.0;
+        mutable std::chrono::steady_clock::time_point deadline_;
+
+        // Best-so-far snapshot (so we can return the best iterate on early exit)
+        mutable Eigen::VectorXd best_x_;
+        mutable double best_f_ = std::numeric_limits<double>::infinity();
+
     private:
+        inline void setTimeBudgetMs(double ms)
+        {
+            time_budget_ms_ = ms;
+            time_budget_enabled_ = (ms > 0.0);
+        }
+
+        // Called once per *iteration* (not per function eval)
+        static int progressTimeGuard(
+            void *instance,
+            const Eigen::VectorXd &x,
+            const Eigen::VectorXd &g,
+            const double fx,
+            const double /*step*/,
+            const int /*k*/,
+            const int /*ls*/)
+        {
+            auto *self = static_cast<GCOPTER_PolytopeSFC *>(instance);
+
+            // Track best-so-far
+            if (fx < self->best_f_)
+            {
+                self->best_f_ = fx;
+                self->best_x_ = x; // copy
+            }
+
+            if (!self->time_budget_enabled_)
+                return 0;
+
+            // Hard stop on wall-clock
+            if (std::chrono::steady_clock::now() >= self->deadline_)
+            {
+                return 1; // non-zero => cancel optimization
+            }
+            return 0;
+        }
+
+        // Called right before each line search to cap the step size
+        static double stepBoundTimeGuard(
+            void *instance,
+            const Eigen::VectorXd &xp,
+            const Eigen::VectorXd &d)
+        {
+            auto *self = static_cast<GCOPTER_PolytopeSFC *>(instance);
+            (void)xp;
+            (void)d;
+
+            if (!self->time_budget_enabled_)
+            {
+                // No extra cap; let the library clamp to param.max_step.
+                return self->lbfgs_params.max_step;
+            }
+
+            // If past the deadline, force a tiny step so the algorithm returns to the
+            // progress callback quickly. This keeps the overrun to ~one iteration.
+            if (std::chrono::steady_clock::now() >= self->deadline_)
+            {
+                return self->lbfgs_params.min_step; // as small as the library allows
+            }
+
+            return self->lbfgs_params.max_step;
+        }
+
         static inline void forwardT(const Eigen::VectorXd &tau,
                                     Eigen::VectorXd &T)
         {
@@ -593,10 +664,10 @@ namespace gcopter
         }
 
         inline void getShortestPath(const Eigen::Vector3d &ini,
-                                           const Eigen::Vector3d &fin,
-                                           const PolyhedraV &vPolys,
-                                           const double &smoothD,
-                                           Eigen::Matrix3Xd &path)
+                                    const Eigen::Vector3d &fin,
+                                    const PolyhedraV &vPolys,
+                                    const double &smoothD,
+                                    Eigen::Matrix3Xd &path)
         {
             const int overlaps = vPolys.size() / 2;
             Eigen::VectorXi vSizes(overlaps);
@@ -820,9 +891,13 @@ namespace gcopter
             vPs = vPolytopes;
         }
 
-        inline double optimize(Trajectory<5> &traj,
-                               const double &relCostTol)
+        inline double optimize_with_timeout(Trajectory<5> &traj,
+                               const double &relCostTol,
+                               double time_budget_ms /* <= 0 means no limit */)
         {
+            // Tell the solver whether we have a budget
+            setTimeBudgetMs(time_budget_ms);
+
             Eigen::VectorXd x(temporalDim + spatialDim);
             Eigen::Map<Eigen::VectorXd> tau(x.data(), temporalDim);
             Eigen::Map<Eigen::VectorXd> xi(x.data() + temporalDim, spatialDim);
@@ -831,49 +906,61 @@ namespace gcopter
             backwardT(times, tau);
             backwardP(points, vPolyIdx, vPolytopes, xi);
 
+            // Save initial guess for later inspection (you already do this)
+            initial_guess_points_ = points;
+            initial_guess_times_ = times;
+            initial_xi_.resize(xi.size());
+            initial_xi_ = xi;
+
+            // Initialize best-so-far
+            best_x_ = x;
+            best_f_ = std::numeric_limits<double>::infinity();
+
             double minCostFunctional;
             lbfgs_params.mem_size = 256;
             lbfgs_params.past = 3;
             lbfgs_params.min_step = 1.0e-32;
-            lbfgs_params.max_iterations = 300;
+            lbfgs_params.max_iterations = 500;
             lbfgs_params.g_epsilon = 1e-5;
             lbfgs_params.delta = relCostTol;
 
             // save initial guess
-            initial_guess_points_ = points;
-            initial_guess_times_ = times;
-
-            using Clock = std::chrono::high_resolution_clock;
+            using Clock = std::chrono::steady_clock;
             auto start = Clock::now();
 
-            int ret = lbfgs::lbfgs_optimize(x,
-                                            minCostFunctional,
-                                            &GCOPTER_PolytopeSFC::costFunctional,
-                                            nullptr,
-                                            nullptr,
-                                            this,
-                                            lbfgs_params);
+            int ret = lbfgs::lbfgs_optimize(
+                x,
+                minCostFunctional,
+                &GCOPTER_PolytopeSFC::costFunctional,     // fused f+g (already in GCOPTER)
+                &GCOPTER_PolytopeSFC::stepBoundTimeGuard, // new (can be nullptr if you prefer)
+                &GCOPTER_PolytopeSFC::progressTimeGuard,  // new
+                this,
+                lbfgs_params);
 
             auto end = Clock::now();
-            computation_time_ms_ = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() * 1e-3;
+            computation_time_ms_ =
+                std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() * 1e-3;
 
-            // if (ret >= 0)
-            // {
+            // If we canceled due to time, restore best-so-far iterate.
+            if (ret == lbfgs::LBFGS_CANCELED && time_budget_enabled_ && best_x_.size() == x.size())
+            {
+                x = best_x_;
+                minCostFunctional = best_f_;
+            }
+
+            // Build trajectory from the (possibly best-so-far) solution
             forwardT(tau, times);
             forwardP(xi, vPolyIdx, vPolytopes, points);
             minco.setParameters(points, times);
             minco.getTrajectory(traj);
-            // }
-            // else
-            // {
-            //     traj.clear();
-            //     minCostFunctional = INFINITY;
-            //     std::cout << "Optimization Failed: "
-            //               << lbfgs::lbfgs_strerror(ret)
-            //               << std::endl;
-            // }
 
             return minCostFunctional;
+        }
+
+        // Keep old API as a wrapper with “no time limit”:
+        inline double optimize(Trajectory<5> &traj, const double &relCostTol)
+        {
+            return optimize_with_timeout(traj, relCostTol, /*time_budget_ms=*/-1.0);
         }
 
         double getComputationTime() const

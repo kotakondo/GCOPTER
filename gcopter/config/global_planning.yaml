@@ -4,7 +4,7 @@
     TargetTopic:                '/goal_pose'
     DilateRadius:               0.5
     VoxelWidth:                 0.25
-    MapBound:                   [-100.0, 100.0, -100.0, 100.0, 0.0, 5.0]
+    MapBound:                   [-35.0, 35.0, -35.0, 35.0, 0.0, 5.0]
     TimeoutRRT:                 1.0
     MaxVelMag:                  4.0
     MaxBdrMag:                  2.1
@@ -17,7 +17,7 @@
     VertDrag:                   0.80
     ParasDrag:                  0.01
     SpeedEps:                   0.0001
-    WeightT:                    1.0e+3  
+    WeightT:                    1e+2  
     ChiVec:                     [1.0e+4, 1.0e+4, 1.0e+4, 1.0e+4, 1.0e+5] # [pos, vel, omega, theta, thrust]
     SmoothingEps:               1.0e-2
     IntegralIntervs:            16
@@ -27,12 +27,12 @@
 
     # MIGHTY-specific parameters
     MIGHTYJerkWeight:           1.0e-3
-    MIGHTYWeightT:              1.0e+2
-    MIGHTYPosWeight:            1.0e+2
-    MIGHTYVelWeight:            1.0e+2
-    MIGHTYOmegaWeight:          1.0e+2
-    MIGHTYThetaWeight:          1.0e+2
-    MIGHTYThrustWeight:         1.0e+2
+    MIGHTYWeightT:              5.0e-1
+    MIGHTYPosWeight:            1.0e0
+    MIGHTYVelWeight:            1.0e0
+    MIGHTYOmegaWeight:          1.0e0
+    MIGHTYThetaWeight:          1.0e0
+    MIGHTYThrustWeight:         1.0e0
     OrientSmoothWeight:         0.0
     TiltBiasWeight:             0.0
     TvarWeight:                 0.0
@@ -40,8 +40,11 @@
     TminPlan:                   0.0
 
     # Collision checking parameters
-    CollisionDt:                 0.01
+    CollisionDt:                0.01
 
     # safe corridor parameters
     sfc_progress:             3.0
     sfc_range:                7.0
+
+    # time out for optimization [ms]
+    opt_timeout_ms:           -1.0   # no decimal point since this will be converted to int. Set to negative value for no timeout

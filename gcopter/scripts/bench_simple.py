@@ -62,7 +62,7 @@ def main():
     # output / run controls
     ap.add_argument("--out_root", default="/media/kkondo/lucas_pro/mighty_gcopter_bench/simple_bench",
                     help="Root directory for cases (same default as bench_sweep.py)")
-    ap.add_argument("--n_runs", type=int, default=10, help="How many repeated runs to execute")
+    ap.add_argument("--n_runs", type=int, default=100, help="How many repeated runs to execute")
     ap.add_argument("--sleep_after_base", type=float, default=3.0, help="Seconds to wait after starting base.launch")
     ap.add_argument("--case_timeout", type=float, default=0.0,
                     help="Seconds to wait for each run before aborting (0 = no timeout)")

@@ -167,22 +167,23 @@ def main():
     )
     # sweep controls
     # ap.add_argument("--out_root", default="/home/kkondo/data/gcopter_csv", help="Root directory for cases")
-    ap.add_argument("--out_root", default="/media/kkondo/lucas_pro/mighty_gcopter_bench", help="Root directory for cases")
+    ap.add_argument("--out_root", default="/media/kkondo/lucas_pro/mighty_gcopter_bench/sweep_bench", help="Root directory for cases")
     ap.add_argument("--v_min", type=float, default=1.0)
     ap.add_argument("--v_max", type=float, default=10.0)
     ap.add_argument("--v_step", type=float, default=1.0)
-    ap.add_argument("--jerk_dec_min", type=int, default=-5)
-    ap.add_argument("--jerk_dec_max", type=int, default=1)
+    ap.add_argument("--jerk_dec_min", type=int, default=-6)
+    ap.add_argument("--jerk_dec_max", type=int, default=-5)
 
     # perimeter goals
     ap.add_argument("--x_min", type=float, default=-30.0)
     ap.add_argument("--x_max", type=float, default= 30.0)
     ap.add_argument("--y_min", type=float, default=-30.0)
     ap.add_argument("--y_max", type=float, default= 30.0)
-    ap.add_argument("--z_goal", type=float, default=1.0)
+    ap.add_argument("--z_goal", type=float, default=2.5)
     ap.add_argument("--perim_step", type=float, default=5.0)
     ap.add_argument("--start_corner", choices=["SW","SE","NE","NW"], default="SW")
     ap.add_argument("--clockwise", action="store_true", help="Traverse perimeter clockwise (default: CCW)")
+
     # ROS launch bits
     ap.add_argument("--pkg_base", default="gcopter")
     ap.add_argument("--base_launch", default="base.launch.py")   # keeps rviz + mockamap alive
@@ -215,7 +216,7 @@ def main():
 
     # Prepare sweep grids
     v_vals  = list(frange(args.v_min, args.v_max, args.v_step))
-    jw_vals = [f"1e{e}" for e in range(args.jerk_dec_min, args.jerk_dec_max + 2)]
+    jw_vals = [f"1e{e}" for e in range(args.jerk_dec_min, args.jerk_dec_max)]
     print(f"[bench] V sweep: {v_vals}")
     print(f"[bench] Jerk weight sweep: {jw_vals}")
 

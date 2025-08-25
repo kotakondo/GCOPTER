@@ -109,8 +109,8 @@ namespace lbfgs
         void pushWaypointsByStaticCorridor(std::vector<Vec3> &wps);
         void getGlobalPath(vec_Vecf<3> &global_path);
         // Computes objective and gradient in one call, reusing a single reconstruct.
-        double evaluateObjectiveAndGradientFused(const Eigen::VectorXd& z, Eigen::VectorXd& grad);
-
+        double evaluateObjectiveAndGradientFused(const Eigen::VectorXd &z, Eigen::VectorXd &grad);
+        double evaluateObjectiveAndGradient(const Eigen::VectorXd &z, Eigen::VectorXd &grad);
 
         // -----------------------------------------------------------------------------
 
@@ -173,6 +173,12 @@ namespace lbfgs
             Eigen::VectorXd &z_opt,
             double &f_opt,
             const lbfgs::lbfgs_parameter_t &param) const;
+
+        int optimize(const Eigen::VectorXd &z0,
+                     Eigen::VectorXd &z_opt,
+                     double &f_opt,
+                     const lbfgs::lbfgs_parameter_t &param,
+                     std::chrono::milliseconds wall_budget) const;
 
         // -----------------------------------------------------------------------------
 
@@ -259,6 +265,7 @@ namespace lbfgs
                                     const state &goal_state,
                                     double &initial_guess_computation_time,
                                     const PolyhedraV &vPolys,
+                                    bool corridor_q_active,
                                     bool use_multiple_initial_guesses = true);
 
         bool extractSeamQFromInitialXi(
@@ -269,7 +276,7 @@ namespace lbfgs
                            const VecXd &d,
                            double eps_base);
 
-        void projectDirectionToFreeVars(Eigen::VectorXd& d) const;
+        void projectDirectionToFreeVars(Eigen::VectorXd &d) const;
 
         void checkGradDirectional(const VecXd &z0,
                                   int num_dirs /*=8*/,
@@ -451,6 +458,29 @@ namespace lbfgs
         void scatterPosGrads(const std::vector<Eigen::Vector3d> &gP,
                              const Eigen::VectorXd &z,
                              Eigen::VectorXd &grad) const;
+
+        // ---- Bernstein basis cache (per kappa) ----
+        struct BernsteinCache
+        {
+            int kappa = -1;                        // cache is valid for this kappa
+            std::vector<std::array<double, 6>> B5; // quintic basis
+            std::vector<std::array<double, 5>> B4; // quartic basis (for d1)
+            std::vector<std::array<double, 4>> B3; // cubic basis (for d2)
+            std::vector<std::array<double, 3>> B2; // quadratic basis (for d3)
+            std::vector<double> W;                 // trapezoid weights: 0.5 at ends, else 1
+        };
+
+        mutable BernsteinCache bern_; // mutable so const methods can use it
+        void ensureBernsteinCache(int kappa) const;
+
+        // Timing and last-iterate bookkeeping (marked mutable so optimize can remain const)
+        mutable std::chrono::steady_clock::time_point opt_start_;
+        mutable std::chrono::steady_clock::time_point opt_deadline_;
+        mutable bool have_deadline_ = false;
+        mutable bool timed_out_ = false;
+
+        mutable Eigen::VectorXd last_z_;
+        mutable double last_f_ = std::numeric_limits<double>::infinity();
 
     protected:
         // ------------------------------

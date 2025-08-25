@@ -14,7 +14,6 @@
 
 // === MIGHTY / LBFGS solver ===
 #include <dynus/lbfgs_solver.hpp> // declares SolverLBFGS, planner_params_t, LinearConstraint3D, etc.
-// ^ this is the public header included by your C++ solver implementation. :contentReference[oaicite:1]{index=1}
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -101,6 +100,9 @@ struct Config
     double sfc_progress; // progress along the route for corridor generation
     double sfc_range;    // range around the route for corridor generation
 
+    // Time out for optimization
+    double opt_timeout_ms; // milliseconds
+
     // Benchmarking
     bool do_benchmark = false; // if false, just visualize once
 
@@ -147,6 +149,7 @@ struct Config
         node.declare_parameter("CollisionDt", 0.01);
         node.declare_parameter("sfc_progress", 0.5);   // progress along the route for corridor generation
         node.declare_parameter("sfc_range", 3.0);      // range around
+        node.declare_parameter("opt_timeout_ms", 5.0); // time out for optimization in milliseconds
         node.declare_parameter("do_benchmark", false); // if false, just visualize once
 
         // Get parameters from the node
@@ -190,6 +193,7 @@ struct Config
         node.get_parameter("CollisionDt", collisionDt);
         node.get_parameter("sfc_progress", sfc_progress);
         node.get_parameter("sfc_range", sfc_range);
+        node.get_parameter("opt_timeout_ms", opt_timeout_ms);
         node.get_parameter("do_benchmark", do_benchmark);
 
         // Print out the configuration
@@ -202,7 +206,7 @@ struct Config
         std::cout << "CollisionDt:  " << collisionDt << std::endl;
         if (exportCSVDir.size() > 0)
         {
-#if __cplusplus >= 201703L
+        #if __cplusplus >= 201703L
             if (!fs::exists(exportCSVDir))
             {
                 if (fs::create_directories(exportCSVDir))
@@ -210,9 +214,9 @@ struct Config
                 else
                     std::cout << "Failed to create export directory: " << exportCSVDir << std::endl;
             }
-#else
+        #else
             std::cout << "Export directory: " << exportCSVDir << " (creation check skipped, needs C++17)" << std::endl;
-#endif
+        #endif
         }
         std::cout << "===============" << std::endl;
     }
@@ -284,44 +288,71 @@ static inline void evalBezier5_PVAJ(const std::array<Eigen::Vector3d, 6> &CP,
     j = 60.0 * invT3 * (e0 * D3[0] + e1 * D3[1] + e2 * D3[2]);
 }
 
-// Sample the GCOPTER trajectory and count collisions against the voxel map.
-// A sample is a "collision" if voxelMap.query(p) != 0
+// Helper: point-in-poly test with optional inward margin and numeric tol.
+// Inside if   n·p + d <= -(margin) + tol   for every row [n|d].
+static inline bool inside_poly_with_margin(
+    const Eigen::Vector3d& p,
+    const Eigen::MatrixX4d& H,
+    double margin = 0.0,
+    double tol = 1e-9)
+{
+    if (H.rows() == 0) return false; // empty poly is never "inside"
+    Eigen::VectorXd s = H.leftCols<3>() * p + H.col(3);
+    return (s.array() <= (-margin + tol)).all();
+}
+
+// Helper: inside at least one SFC poly (union)
+static inline bool inside_any_corridor(
+    const Eigen::Vector3d& p,
+    const std::vector<Eigen::MatrixX4d>& hPolys,
+    double margin = 0.0,
+    double tol = 1e-9)
+{
+    for (const auto& H : hPolys)
+        if (inside_poly_with_margin(p, H, margin, tol))
+            return true;
+    return false;
+}
+
+// GCOPTER: count samples that fall OUTSIDE all corridor polytopes.
 static int countCollisionsGCOPTER(const Trajectory<5> &traj,
-                                  const voxel_map::VoxelMap &voxelMap,
-                                  double dt)
+                                  const std::vector<Eigen::MatrixX4d> &hPolys,
+                                  double dt,
+                                  double inward_margin = 0.0,
+                                  double tol = 1e-9)
 {
     const double Ttot = traj.getTotalDuration();
-    if (Ttot <= 0.0)
-        return 0;
+    if (Ttot <= 0.0) return 0;
 
     const double h = std::max(1e-6, dt);
     const int N = std::max(1, (int)std::ceil(Ttot / h));
-    int hits = 0;
+    int violations = 0;
 
     for (int i = 0; i <= N; ++i)
     {
         const double t = std::min(Ttot, i * h);
         const Eigen::Vector3d p = traj.getPos(t);
-        if (voxelMap.query(p) != 0)
-            ++hits;
+        if (!inside_any_corridor(p, hPolys, inward_margin, tol))
+            ++violations;
     }
-    return hits;
+    return violations;
 }
 
-// Sample the MIGHTY (Bezier) trajectory and count collisions against the voxel map.
+// MIGHTY (Bezier): count samples that fall OUTSIDE all corridor polytopes.
 static int countCollisionsMIGHTY(const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
                                  const std::vector<double> &T,
-                                 const voxel_map::VoxelMap &voxelMap,
-                                 double dt)
+                                 const std::vector<Eigen::MatrixX4d> &hPolys,
+                                 double dt,
+                                 double inward_margin = 0.0,
+                                 double tol = 1e-9)
 {
     const int Mseg = (int)CP.size();
-    if (Mseg == 0)
-        return 0;
+    if (Mseg == 0) return 0;
 
     // cumulative time-edges
     std::vector<double> edges(Mseg + 1, 0.0);
-    for (int s = 0; s < Mseg; ++s)
-        edges[s + 1] = edges[s] + T[s];
+    for (int s = 0; s < Mseg; ++s) edges[s + 1] = edges[s] + T[s];
+
     const double Ttot = edges.back();
     const double h = std::max(1e-6, dt);
     const int N = std::max(1, (int)std::ceil(Ttot / h));
@@ -331,21 +362,21 @@ static int countCollisionsMIGHTY(const std::vector<std::array<Eigen::Vector3d, 6
         t = std::clamp(t, 0.0, Ttot);
         int s = std::clamp((int)(std::upper_bound(edges.begin(), edges.end(), t) - edges.begin()) - 1, 0, Mseg - 1);
         const double Ts = std::max(1e-9, T[s]);
-        const double u = std::clamp((t - edges[s]) / Ts, 0.0, 1.0);
+        const double u  = std::clamp((t - edges[s]) / Ts, 0.0, 1.0);
         Eigen::Vector3d p, v, a, j;
         evalBezier5_PVAJ(CP[s], Ts, u, p, v, a, j);
         return p;
     };
 
-    int hits = 0;
+    int violations = 0;
     for (int i = 0; i <= N; ++i)
     {
         const double t = std::min(Ttot, i * h);
         const Eigen::Vector3d p = eval_pos(t);
-        if (voxelMap.query(p) != 0)
-            ++hits;
+        if (!inside_any_corridor(p, hPolys, inward_margin, tol))
+            ++violations;
     }
-    return hits;
+    return violations;
 }
 
 // Sample GCOPTER trajectory at a uniform dt and integrate speed and jerk-norm via trapezoid.
@@ -541,9 +572,10 @@ static MightyOut runMighty(
     std::vector<std::shared_ptr<dynTraj>> obstacles; // none for now
 
     double t0 = 0.0, ig_ms = 0.0;
+    bool corridor_q_active = false;
     solver->prepareSolverForReplan(
         t0, global_wps, safe_corridor, initial_xi, obstacles,
-        initial_state, final_state, ig_ms, vPolytopes, false); // :contentReference[oaicite:3]{index=3}
+        initial_state, final_state, ig_ms, vPolytopes, corridor_q_active, false); // :contentReference[oaicite:3]{index=3}
 
     // Get the single initial guess we just built
     const std::vector<Eigen::VectorXd> &z0_list = solver->getInitialGuesses();
@@ -560,14 +592,26 @@ static MightyOut runMighty(
     lb.mem_size = 256;
     lb.past = 3;
     lb.min_step = 1.0e-32;
-    lb.max_iterations = 300;
+    lb.max_iterations = 500;
     lb.g_epsilon = 1.0e-5;       // gradient tolerance
     lb.delta = cfg.relCostTol; // relative cost tolerance
 
     Eigen::VectorXd zopt;
     double fopt = 0.0;
+
     auto t_start = Clock::now();
-    solver->optimize(z0, zopt, fopt, lb); // LBFGS entrypoint (objective+analytic grad) :contentReference[oaicite:4]{index=4}
+
+    if (cfg.opt_timeout_ms < 0.0)
+    {
+        // No timeout
+        solver->optimize(z0, zopt, fopt, lb); // LBFGS entrypoint (objective+analytic grad) :contentReference[oaicite:4]{index=4}
+    }
+    else
+    {
+        // With timeout
+        solver->optimize(z0, zopt, fopt, lb, std::chrono::milliseconds((int)cfg.opt_timeout_ms)); // LBFGS entrypoint (objective+analytic grad) :contentReference[oaicite:4]{index=4}
+    }
+
     auto t_end = Clock::now();
 
     out.wall_ms = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count() * 1e-3;
@@ -790,7 +834,7 @@ public:
             return;
         }
 
-        if (std::isinf(gcopter.optimize(traj, config.relCostTol)))
+        if (std::isinf(gcopter.optimize_with_timeout(traj, config.relCostTol, config.opt_timeout_ms)))
         {
             RCLCPP_ERROR(this->get_logger(), "GCOPTER optimize failed.");
             return;
@@ -811,9 +855,12 @@ public:
         gcopter.getVPolytopes(vPolys);
 
         // === 3) Metrics for GCOPTER
+        // Collision check margin
+        double cc_inward_margin = 0.0;
+        double cc_tol = 1e-1;
         Metrics M_gc = computeMetricsGCOPTER_sampled_dt(traj, config.sampleDt);
         M_gc.solve_ms = gc_ms;
-        M_gc.n_collisions = countCollisionsGCOPTER(traj, voxelMapRaw_, config.collisionDt);
+        M_gc.n_collisions = countCollisionsGCOPTER(traj, hPolys, config.collisionDt, cc_inward_margin, cc_tol);
 
         // Get GCOPTER's initial guess for MIGHTY
         Eigen::Matrix3Xd init_points;
@@ -920,7 +967,7 @@ public:
         // === 6) Metrics for MIGHTY
         Metrics M_m = computeMetricsMIGHTY_sampled_dt(M_mighty.CP, M_mighty.T, /*dt=*/config.sampleDt);
         M_m.solve_ms = M_mighty.wall_ms;
-        M_m.n_collisions = countCollisionsMIGHTY(M_mighty.CP, M_mighty.T, voxelMapRaw_, config.collisionDt);
+        M_m.n_collisions = countCollisionsMIGHTY(M_mighty.CP, M_mighty.T, hPolys, config.collisionDt, /* inward_margin */ cc_inward_margin, /* tol */ cc_tol);
 
         // === 7) Print comparison & wall times
         printCompare("GCOPTER", M_gc, "MIGHTY", M_m);
