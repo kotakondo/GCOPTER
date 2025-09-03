@@ -226,7 +226,7 @@ struct Config
         std::cout << "CollisionDt:  " << collisionDt << std::endl;
         if (exportCSVDir.size() > 0)
         {
-        #if __cplusplus >= 201703L
+#if __cplusplus >= 201703L
             if (!fs::exists(exportCSVDir))
             {
                 if (fs::create_directories(exportCSVDir))
@@ -234,15 +234,15 @@ struct Config
                 else
                     std::cout << "Failed to create export directory: " << exportCSVDir << std::endl;
             }
-        #else
+#else
             std::cout << "Export directory: " << exportCSVDir << " (creation check skipped, needs C++17)" << std::endl;
-        #endif
+#endif
         }
         std::cout << "===============" << std::endl;
     }
 };
 
-// === Simple metrics shared by both planners
+// Metrics shared by both planners
 struct Metrics
 {
     double time_s{0.0};    // total trajectory duration
@@ -252,7 +252,7 @@ struct Metrics
     int n_collisions{0};   // # sampled positions that hit occupied voxels
 };
 
-// Degree-5 Bézier evaluator (pos,vel,acc,jer) at u∈[0,1] for one segment (same as before)
+// Evaluate a 5th-degree Bezier curve.
 static inline void evalBezier5_PVAJ(const std::array<Eigen::Vector3d, 6> &CP,
                                     double T, double u,
                                     Eigen::Vector3d &p,
@@ -309,26 +309,27 @@ static inline void evalBezier5_PVAJ(const std::array<Eigen::Vector3d, 6> &CP,
 }
 
 // Helper: point-in-poly test with optional inward margin and numeric tol.
-// Inside if   n·p + d <= -(margin) + tol   for every row [n|d].
+// Inside if n·p + d <= -(margin) + tol   for every row [n|d].
 static inline bool inside_poly_with_margin(
-    const Eigen::Vector3d& p,
-    const Eigen::MatrixX4d& H,
+    const Eigen::Vector3d &p,
+    const Eigen::MatrixX4d &H,
     double margin = 0.0,
     double tol = 1e-9)
 {
-    if (H.rows() == 0) return false; // empty poly is never "inside"
+    if (H.rows() == 0)
+        return false; // empty poly is never "inside"
     Eigen::VectorXd s = H.leftCols<3>() * p + H.col(3);
     return (s.array() <= (-margin + tol)).all();
 }
 
 // Helper: inside at least one SFC poly (union)
 static inline bool inside_any_corridor(
-    const Eigen::Vector3d& p,
-    const std::vector<Eigen::MatrixX4d>& hPolys,
+    const Eigen::Vector3d &p,
+    const std::vector<Eigen::MatrixX4d> &hPolys,
     double margin = 0.0,
     double tol = 1e-9)
 {
-    for (const auto& H : hPolys)
+    for (const auto &H : hPolys)
         if (inside_poly_with_margin(p, H, margin, tol))
             return true;
     return false;
@@ -342,7 +343,8 @@ static int countCollisionsGCOPTER(const Trajectory<5> &traj,
                                   double tol = 1e-9)
 {
     const double Ttot = traj.getTotalDuration();
-    if (Ttot <= 0.0) return 0;
+    if (Ttot <= 0.0)
+        return 0;
 
     const double h = std::max(1e-6, dt);
     const int N = std::max(1, (int)std::ceil(Ttot / h));
@@ -367,11 +369,13 @@ static int countCollisionsMIGHTY(const std::vector<std::array<Eigen::Vector3d, 6
                                  double tol = 1e-9)
 {
     const int Mseg = (int)CP.size();
-    if (Mseg == 0) return 0;
+    if (Mseg == 0)
+        return 0;
 
     // cumulative time-edges
     std::vector<double> edges(Mseg + 1, 0.0);
-    for (int s = 0; s < Mseg; ++s) edges[s + 1] = edges[s] + T[s];
+    for (int s = 0; s < Mseg; ++s)
+        edges[s + 1] = edges[s] + T[s];
 
     const double Ttot = edges.back();
     const double h = std::max(1e-6, dt);
@@ -382,7 +386,7 @@ static int countCollisionsMIGHTY(const std::vector<std::array<Eigen::Vector3d, 6
         t = std::clamp(t, 0.0, Ttot);
         int s = std::clamp((int)(std::upper_bound(edges.begin(), edges.end(), t) - edges.begin()) - 1, 0, Mseg - 1);
         const double Ts = std::max(1e-9, T[s]);
-        const double u  = std::clamp((t - edges[s]) / Ts, 0.0, 1.0);
+        const double u = std::clamp((t - edges[s]) / Ts, 0.0, 1.0);
         Eigen::Vector3d p, v, a, j;
         evalBezier5_PVAJ(CP[s], Ts, u, p, v, a, j);
         return p;
@@ -399,7 +403,20 @@ static int countCollisionsMIGHTY(const std::vector<std::array<Eigen::Vector3d, 6
     return violations;
 }
 
-// Sample GCOPTER trajectory at a uniform dt and integrate speed and jerk-norm via trapezoid.
+// Sample MIGHTY trajectory at a uniform dt.
+struct Kahan
+{
+    double s = 0.0, c = 0.0;
+    inline void add(double y)
+    {
+        double t = y - c, tmp = s + t;
+        c = (tmp - s) - t;
+        s = tmp;
+    }
+    inline double value() const { return s; }
+};
+
+// Compute metrics for GCOPTER
 static Metrics computeMetricsGCOPTER_sampled_dt(const Trajectory<5> &traj, double dt)
 {
     Metrics M;
@@ -413,7 +430,9 @@ static Metrics computeMetricsGCOPTER_sampled_dt(const Trajectory<5> &traj, doubl
     const int N = std::max(1, (int)std::ceil(Ttot / h));
 
     double t_prev = 0.0;
+    Eigen::Vector3d p_prev = traj.getPos(0.0);
     Eigen::Vector3d v_prev = traj.getVel(0.0);
+    Eigen::Vector3d a_prev = traj.getAcc(0.0);
     Eigen::Vector3d j_prev = traj.getJer(0.0);
 
     for (int i = 1; i <= N; ++i)
@@ -421,30 +440,28 @@ static Metrics computeMetricsGCOPTER_sampled_dt(const Trajectory<5> &traj, doubl
         const double t = std::min(Ttot, i * h);
         const double hi = t - t_prev;
 
+        const Eigen::Vector3d p = traj.getPos(t);
         const Eigen::Vector3d v = traj.getVel(t);
+        const Eigen::Vector3d a = traj.getAcc(t);
         const Eigen::Vector3d j = traj.getJer(t);
 
-        // path length: ∫ ||v|| dt
-        M.path_len += 0.5 * (v_prev.norm() + v.norm()) * hi;
+        // path length:
+        M.path_len += (p - p_prev).norm();
 
         // jerk_cost: ∫ ||j|| dt   (change to j.squaredNorm() if you want ∫||j||^2)
         M.jerk_cost += 0.5 * (j_prev.norm() + j.norm()) * hi; // <-- change to .squaredNorm() for L2^2
 
         // advance
         t_prev = t;
+        p_prev = p;
         v_prev = v;
+        a_prev = a;
         j_prev = j;
     }
     return M;
 }
 
-// Sample MIGHTY trajectory at a uniform dt and integrate speed and jerk-norm via trapezoid.
-struct Kahan {
-    double s = 0.0, c = 0.0;
-    inline void add(double y) { double t=y-c, tmp=s+t; c=(tmp-s)-t; s=tmp; }
-    inline double value() const { return s; }
-};
-
+// Compute metrics for MIGHTY
 static Metrics computeMetricsMIGHTY_sampled_dt(
     const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
     const std::vector<double> &T,
@@ -452,11 +469,13 @@ static Metrics computeMetricsMIGHTY_sampled_dt(
 {
     Metrics M{};
     const int Mseg = (int)CP.size();
-    if (Mseg == 0) return M;
+    if (Mseg == 0)
+        return M;
 
     // Edges
     std::vector<double> edges(Mseg + 1, 0.0);
-    for (int s = 0; s < Mseg; ++s) edges[s + 1] = edges[s] + T[s];
+    for (int s = 0; s < Mseg; ++s)
+        edges[s + 1] = edges[s] + T[s];
     const double Ttot = edges.back();
     M.time_s = Ttot;
 
@@ -472,7 +491,7 @@ static Metrics computeMetricsMIGHTY_sampled_dt(
         int s = (int)(std::upper_bound(edges.begin(), edges.end(), t) - edges.begin()) - 1;
         s = std::clamp(s, 0, Mseg - 1);
         const double Ts = std::max(1e-9, T[s]);
-        const double u  = std::clamp((t - edges[s]) / Ts, 0.0, 1.0);
+        const double u = std::clamp((t - edges[s]) / Ts, 0.0, 1.0);
         Eigen::Vector3d p, v, a, j;
         evalBezier5_PVAJ(CP[s], Ts, u, p, v, a, j);
         return {p, v, a, j};
@@ -488,11 +507,13 @@ static Metrics computeMetricsMIGHTY_sampled_dt(
 
     Kahan path_sum, jerk2_sum;
 
-    for (int i = 1; i <= N; ++i) {
+    for (int i = 1; i <= N; ++i)
+    {
         const double t_target = std::min(Ttot, i * h);
 
         // Take one or two sub-steps so we never straddle a seam
-        while (t_prev < t_target - 1e-15) {
+        while (t_prev < t_target - 1e-15)
+        {
             const double next_seam = (k < Mseg ? edges[k + 1] : Ttot);
             const double t = std::min(t_target, next_seam);
             const double hi = t - t_prev;
@@ -508,18 +529,23 @@ static Metrics computeMetricsMIGHTY_sampled_dt(
 
             // Advance
             t_prev = t;
-            p_prev = p; v_prev = v; a_prev = a; j_prev = j;
+            p_prev = p;
+            v_prev = v;
+            a_prev = a;
+            j_prev = j;
 
             // If we exactly hit a seam, move to the next segment
-            if (t >= next_seam - 1e-15 && k < Mseg) ++k;
+            if (t >= next_seam - 1e-15 && k < Mseg)
+                ++k;
         }
     }
 
-    M.path_len  = path_sum.value();
-    M.jerk_cost = jerk2_sum.value();  // this is ∫||j||^2 dt
+    M.path_len = path_sum.value();
+    M.jerk_cost = jerk2_sum.value(); // this is ∫||j||^2 dt
     return M;
 }
 
+// Convert GCOPTER's H-rep (Ax + b <= 0) to MIGHTY's (−Ax ≤ b)
 static std::vector<LinearConstraint3D>
 toLinearConstraints(const std::vector<Eigen::MatrixX4d> &hPolys)
 {
@@ -597,6 +623,7 @@ struct MightyOut
     double wall_ms{0.0};
 };
 
+// Run MIGHTY on the same problem as GCOPTER
 static MightyOut runMighty(
     const vec_Vecf<3> &global_wps,
     const PolyhedraV &vPolytopes,
@@ -609,19 +636,19 @@ static MightyOut runMighty(
     const Config &cfg,
     const Eigen::VectorXd &physical_params)
 {
+
+    // 1) Prepare
     MightyOut out;
     using Clock = std::chrono::high_resolution_clock;
 
     // 2) Build solver; prepare problem
     auto solver = std::make_shared<SolverLBFGS>();
-    solver->initializeSolver(params, physical_params); // immutable settings (weights, limits, etc) :contentReference[oaicite:2]{index=2}
-
+    solver->initializeSolver(params, physical_params);
     std::vector<std::shared_ptr<dynTraj>> obstacles; // none for now
-
     double t0 = 0.0, ig_ms = 0.0;
     solver->prepareSolverForReplan(
         t0, global_wps, safe_corridor, initial_xi, init_times, obstacles,
-        initial_state, final_state, ig_ms, vPolytopes, false); // :contentReference[oaicite:3]{index=3}
+        initial_state, final_state, ig_ms, vPolytopes, false);
 
     // Get the single initial guess we just built
     const std::vector<Eigen::VectorXd> &z0_list = solver->getInitialGuesses();
@@ -639,30 +666,27 @@ static MightyOut runMighty(
     lb.past = cfg.lbfgs_past;
     lb.min_step = cfg.lbfgs_min_step;
     lb.max_iterations = cfg.lbfgs_max_iterations;
-    lb.g_epsilon = cfg.lbfgs_g_epsilon;       // gradient tolerance
-    lb.delta = cfg.relCostTol; // relative cost tolerance
+    lb.g_epsilon = cfg.lbfgs_g_epsilon; // gradient tolerance
+    lb.delta = cfg.relCostTol;          // relative cost tolerance
 
     // Scale derivative variables?
     solver->setScaleDerivatives(cfg.use_scaled_cost);
-
     Eigen::VectorXd zopt;
     double fopt = 0.0;
-
     auto t_start = Clock::now();
 
     if (cfg.opt_timeout_ms < 0.0)
     {
         // No timeout
-        solver->optimize(z0, zopt, fopt, lb); // LBFGS entrypoint (objective+analytic grad) :contentReference[oaicite:4]{index=4}
+        solver->optimize(z0, zopt, fopt, lb);
     }
     else
     {
         // With timeout
-        solver->optimize(z0, zopt, fopt, lb, std::chrono::milliseconds((int)cfg.opt_timeout_ms)); // LBFGS entrypoint (objective+analytic grad) :contentReference[oaicite:4]{index=4}
+        solver->optimize(z0, zopt, fopt, lb, std::chrono::milliseconds((int)cfg.opt_timeout_ms));
     }
 
     auto t_end = Clock::now();
-
     out.wall_ms = std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count() * 1e-3;
     out.obj = fopt;
 
@@ -671,7 +695,7 @@ static MightyOut runMighty(
         std::vector<Vec3> P, V, A;
         std::vector<std::array<Vec3, 6>> CPv; // CP[s][0..5]
         std::vector<double> Tv;
-        solver->reconstruct(zopt, P, V, A, CPv, Tv); // public; fills all fields :contentReference[oaicite:5]{index=5}
+        solver->reconstruct(zopt, P, V, A, CPv, Tv);
 
         // Copy to Eigen::Vector3d form the rest of this file uses
         out.CP.resize(CPv.size());
@@ -689,7 +713,9 @@ static MightyOut runMighty(
 // === ROS2 Planner node (mostly your original, with a "MIGHTY" section appended)
 class GlobalPlanner : public rclcpp::Node
 {
+
 private:
+
     Config config;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr mapSub;
     Visualizer visualizer;
@@ -722,6 +748,8 @@ private:
     }
 
 public:
+
+    // Constructor
     GlobalPlanner() : Node("minco_bench_viz"), config(*this), visualizer(*this)
     {
         Eigen::Vector3i xyz(
@@ -756,6 +784,7 @@ public:
                     config.mapTopic.c_str());
     }
 
+    // Get do_benchmark flag
     bool getDoBenchmark() const { return config.do_benchmark; }
 
     void mapCallBack(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
@@ -849,22 +878,20 @@ public:
             return;
         }
 
+        // === 2) SFC corridor
         std::vector<Eigen::MatrixX4d> hPolys;
         std::vector<Eigen::Vector3d> pc;
         voxelMapInfl_.getSurf(pc);
         sfc_gen::convexCover(route, pc, voxelMapInfl_.getOrigin(), voxelMapInfl_.getCorner(), config.sfc_progress, config.sfc_range, hPolys);
-
         sfc_gen::shortCut(hPolys);
-
-        // Visualize SFC once (timer keeps them alive)
         visualizer.visualizePolytope(hPolys);
 
-        // Boundary states (pos, vel=0, acc=0)
+        // === 3) Boundary states (pos, vel=0, acc=0)
         Eigen::Matrix3d iniState, finState;
         iniState << route.front(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
         finState << route.back(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
 
-        // === 2) GCOPTER
+        // === 4) GCOPTER
         gcopter::GCOPTER_PolytopeSFC gcopter;
         Eigen::VectorXd magnitudeBounds(5), penaltyWeights(5), physicalParams(6);
         magnitudeBounds << config.maxVelMag, config.maxBdrMag, config.maxTiltAngle,
@@ -899,26 +926,21 @@ public:
             hPolysCache_ = hPolys;
         }
 
-        // Get vPolytopes
         PolyhedraV vPolys;
         gcopter.getVPolytopes(vPolys);
 
-        // === 3) Metrics for GCOPTER
-        // Collision check margin
+        // === 5) Metrics for GCOPTER
         double cc_inward_margin = 0.0;
         double cc_tol = 1e-1;
         Metrics M_gc = computeMetricsGCOPTER_sampled_dt(traj, config.sampleDt);
         M_gc.solve_ms = gc_ms;
         M_gc.n_collisions = countCollisionsGCOPTER(traj, hPolys, config.collisionDt, cc_inward_margin, cc_tol);
-
-        // Get GCOPTER's initial guess for MIGHTY
         Eigen::Matrix3Xd init_points;
         Eigen::VectorXd init_times, initial_xi;
         gcopter.getInitialGuess(init_points, init_times, initial_xi);
-
         int init_size = init_points.cols();
 
-        // === 4) Build MIGHTY params mapped from config
+        // === 6) Build MIGHTY params
         planner_params_t mighty_cfg{};
         mighty_cfg.verbose = true;
         mighty_cfg.V_nom = config.maxVelMag;
@@ -940,7 +962,7 @@ public:
         mighty_cfg.Tmin_plan = config.TminPlan;                           // Tmin for planning
         mighty_cfg.num_dyn_obst_samples = 64;
         mighty_cfg.init_turn_bf = 40.0; // degrees
-        mighty_cfg.Co = 0.0;           // corridor “soft margin”
+        mighty_cfg.Co = 0.0;            // corridor “soft margin”
         mighty_cfg.Cw = 0.40;           // dyn obstacle radius (unused here)
         mighty_cfg.BIG = 1e9;
         mighty_cfg.dc = 0.01; // sampling step for setpoints
@@ -954,7 +976,7 @@ public:
         mighty_cfg.mass = config.vehicleMass; // mass in kg
         mighty_cfg.g = config.gravAcc;        // gravity in m/s^2
 
-        // Prepare initial/goal states for MIGHTY (pos/vel/acc)
+        // === 7) Build MIGHTY boundary conditions
         state init_state, goal_state;
         init_state.pos = Vec3(route.front().x(), route.front().y(), route.front().z());
         init_state.vel = Vec3::Zero();
@@ -963,7 +985,7 @@ public:
         goal_state.vel = Vec3::Zero();
         goal_state.accel = Vec3::Zero();
 
-        // Convert route (Eigen) to MIGHTY vector type
+        // === 8) Build MIGHTY initial guess (from GCOPTER)
         vec_Vecf<3> route_m;
         route_m.reserve(init_points.size() + 2); // +2 for start/goal
         route_m.emplace_back(init_state.pos.x(), init_state.pos.y(), init_state.pos.z());
@@ -971,32 +993,22 @@ public:
             route_m.emplace_back(p.x(), p.y(), p.z());
         route_m.emplace_back(goal_state.pos.x(), goal_state.pos.y(), goal_state.pos.z());
 
-        // === 5) Run MIGHTY
-        // Build exactly-one-poly-per-segment corridor for MIGHTY
-
-        // Ensure interior points lie inside both adjacent polytopes (nudged inward by 2 cm)
-        // bool ok_fix = enforceRouteInsideCorridor(route_m, hPolys, /*inward_margin=*/0.02, /*max_passes=*/20);
-        // if (!ok_fix)
-        // {
-        //     RCLCPP_WARN(this->get_logger(), "Some waypoints still near/outside corridor after projection.");
-        // }
-
-        // Convert GCOPTER’s hPolys to MIGHTY constraints
+        // === 9) Convert GCOPTER’s hPolys to MIGHTY constraints
         std::vector<LinearConstraint3D> l_constraints = toLinearConstraints(hPolys);
         MightyOut M_mighty = runMighty(route_m, vPolys, initial_xi, init_times, l_constraints, init_state, goal_state, mighty_cfg, config, physicalParams);
 
-        // Draw MIGHTY trajectory in green, with its own namespace
+        // === 10) Draw MIGHTY trajectory in green, with its own namespace
         visualizer.visualizeBezier(M_mighty.CP, M_mighty.T, /*ns=*/"mighty", /*width=*/0.06,
                                    /*samples=*/120, /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
                                    /*frame_id=*/"world");
 
-        // Cache cumulative edges for fast lookup
+        // === 11) Cache cumulative edges for fast lookup
         mightyEdges_.assign(M_mighty.T.size() + 1, 0.0);
         for (size_t s = 0; s < M_mighty.T.size(); ++s)
             mightyEdges_[s + 1] = mightyEdges_[s] + M_mighty.T[s];
         mightyStamp_ = this->now().seconds();
 
-        // Build MIGHTY knot positions from Bezier CPs: P0 = CP[0][0], P_{s+1} = CP[s][5]
+        // === 12) Build MIGHTY knot positions from Bezier CPs: P0 = CP[0][0], P_{s+1} = CP[s][5]
         mightyKnots_.clear();
         if (!M_mighty.CP.empty())
         {
@@ -1005,7 +1017,7 @@ public:
                 mightyKnots_.push_back(M_mighty.CP[s][5]);
         }
 
-        // Show knots as green spheres (persistent)
+        // === 13) Show knots as green spheres (persistent)
         visualizer.visualizePoints(mightyKnots_,
                                    /*radius=*/0.07f,
                                    /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
@@ -1013,12 +1025,12 @@ public:
                                    /*ns=*/"mighty_knots",
                                    /*ttl=*/0.0);
 
-        // === 6) Metrics for MIGHTY
+        // === 14) Metrics for MIGHTY
         Metrics M_m = computeMetricsMIGHTY_sampled_dt(M_mighty.CP, M_mighty.T, /*dt=*/config.sampleDt);
         M_m.solve_ms = M_mighty.wall_ms;
         M_m.n_collisions = countCollisionsMIGHTY(M_mighty.CP, M_mighty.T, hPolys, config.collisionDt, /* inward_margin */ cc_inward_margin, /* tol */ cc_tol);
 
-        // === 7) Print comparison & wall times
+        // === 15) Print comparison & wall times
         printCompare("GCOPTER", M_gc, "MIGHTY", M_m);
         std::cout << "GCOPTER solve time [ms]: (printed by library or external timer)\n";
         std::cout << "MIGHTY  solve time [ms]: " << M_mighty.wall_ms << "\n";
@@ -1034,10 +1046,9 @@ public:
             // start and goal are already available in plan() as Eigen::Vector3d start, goal
             appendStatsCSV(csv, config, startGoal.front(), startGoal.back(), M_gc, M_m);
         }
-
         M_mighty_ = M_mighty;
 
-        // === 8) Export VAJ histories to CSV (for Python plotting)
+        // === 16) Export VAJ histories to CSV (for Python plotting)
         // Export GCOPTER and MIGHTY VAJ CSVs if requested
         if (!config.exportCSVDir.empty())
         {
@@ -1057,74 +1068,6 @@ public:
                 config.horizDrag, config.vertDrag, config.parasDrag,
                 config.speedEps);
         }
-    }
-
-    bool cvxEllipsoidDecomp(const vec_Vecf<3> &path,
-                            const vec_Vecf<3> &vec_o,
-                            std::vector<LinearConstraint3D> &l_constraints,
-                            vec_E<Polyhedron<3>> &poly_out)
-    {
-
-        // Initialize result.
-        bool result = true;
-
-        // For decomposition
-        EllipsoidDecomp3D ellip_decomp_util;
-
-        // Get occupied cells.
-        ellip_decomp_util.set_obs(vec_o);
-
-        // Set the local bounding box and z constraints.
-        ellip_decomp_util.set_local_bbox(Vec3f(4.0, 4.0, 4.0));
-        ellip_decomp_util.set_z_min_and_max(-1.0, 5.0); // buffer for the drone size
-
-        // Find convex polyhedra.
-        ellip_decomp_util.dilate(path, result);
-
-        if (!result)
-            return false;
-
-        // Get the polyhedra.
-        auto polys = ellip_decomp_util.get_polyhedrons();
-
-        // Preallocate the constraints vector.
-        size_t numConstraints = (path.size() > 0) ? (path.size() - 1) : 0;
-        l_constraints.clear();
-        l_constraints.resize(numConstraints);
-
-        // Flag to record if any thread finds an error.
-        bool errorFound = false;
-
-        // Parallelize the constraint computation loop.
-        for (int i = 0; i < static_cast<int>(numConstraints); i++)
-        {
-
-            // Compute the midpoint between consecutive path points.
-            auto pt_inside = (path[i] + path[i + 1]) / 2.0;
-            LinearConstraint3D cs(pt_inside, polys[i].hyperplanes(), polys[i]);
-
-            // If either matrix A_ or vector b_ contains NaN, mark an error.
-            if (cs.A_.hasNaN() || cs.b_.hasNaN())
-            {
-                errorFound = true;
-            }
-            else
-            {
-                l_constraints[i] = cs;
-            }
-        }
-
-        // If an error was detected, report and exit.
-        if (errorFound)
-        {
-            std::cout << "A_ or b_ has NaN" << std::endl;
-            return false;
-        }
-
-        // Return the computed polyhedra.
-        poly_out = std::move(polys);
-
-        return true;
     }
 
     void republishMarkers_()
@@ -1274,168 +1217,6 @@ public:
         visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, /*ns=*/"mighty", /*width=*/0.06,
                                    /*samples=*/120, /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
                                    /*frame_id=*/"odom");
-    }
-
-    // Check & fix interior waypoints against segment corridors (H rows: [nx ny nz d], inside if n·x + d <= 0).
-    // route_m.size() == hPolys.size() + 1 expected (one poly per segment).
-    static bool enforceRouteInsideCorridor(vec_Vecf<3> &route_m,
-                                           const std::vector<Eigen::MatrixX4d> &hPolys,
-                                           double inward_margin = 0.02, // how far to push inside after projection [m]
-                                           int max_passes = 5,          // POCS passes per waypoint
-                                           double tol = 1e-9)           // numeric tolerance
-    {
-        const int M = static_cast<int>(route_m.size()) - 1; // number of segments
-        if (M <= 0 || (int)hPolys.size() < M)
-        {
-            // Nothing to do or corridor size mismatch (be permissive).
-            return true;
-        }
-
-        auto inside_with_margin = [&](const Eigen::Vector3d &p,
-                                      const Eigen::MatrixX4d &H,
-                                      double margin) -> bool
-        {
-            // inside if max_k (n_k · p + d_k + margin) <= 0
-            const Eigen::VectorXd vals = H.leftCols<3>() * p + H.rightCols<1>();
-            return (vals.array() + margin).maxCoeff() <= 0.0 + tol;
-        };
-
-        bool all_ok = true;
-
-        // Interior points only: idx = 1..M-1
-        for (int idx = 1; idx < M; ++idx)
-        {
-            // Clamp corridor indices defensively
-            const int sL = std::max(0, std::min(idx - 1, (int)hPolys.size() - 1));
-            const int sR = std::max(0, std::min(idx, (int)hPolys.size() - 1));
-
-            // Work copy (Eigen) then write back to route_m
-            Eigen::Vector3d p = route_m[idx].template cast<double>();
-
-            // Early exit if already inside both with margin
-            bool okL = inside_with_margin(p, hPolys[sL], inward_margin);
-            bool okR = inside_with_margin(p, hPolys[sR], inward_margin);
-            if (okL && okR)
-            {
-                // write back (no-op usually, keeps numeric type consistent)
-                route_m[idx] = p;
-                continue;
-            }
-
-            // Cyclic projections onto violating planes of both polytopes
-            for (int pass = 0; pass < max_passes; ++pass)
-            {
-                // Left segment poly
-                {
-                    const Eigen::MatrixX4d &H = hPolys[sL];
-                    const int K = (int)H.rows();
-                    for (int k = 0; k < K; ++k)
-                    {
-                        const Eigen::Vector3d n = H.block<1, 3>(k, 0).transpose();
-                        const double d = H(k, 3);
-                        // we want n·p + d <= -inward_margin
-                        const double val = n.dot(p) + d + inward_margin;
-                        if (val > 0.0)
-                        {
-                            const double nn = n.squaredNorm() + 1e-12;
-                            // project onto plane n·x + d = -inward_margin (so we land *inside* by margin)
-                            p -= (val / nn) * n;
-                        }
-                    }
-                }
-                // Right segment poly
-                {
-                    const Eigen::MatrixX4d &H = hPolys[sR];
-                    const int K = (int)H.rows();
-                    for (int k = 0; k < K; ++k)
-                    {
-                        const Eigen::Vector3d n = H.block<1, 3>(k, 0).transpose();
-                        const double d = H(k, 3);
-                        const double val = n.dot(p) + d + inward_margin;
-                        if (val > 0.0)
-                        {
-                            const double nn = n.squaredNorm() + 1e-12;
-                            p -= (val / nn) * n;
-                        }
-                    }
-                }
-
-                // Check stop condition
-                bool nowL = inside_with_margin(p, hPolys[sL], inward_margin);
-                bool nowR = inside_with_margin(p, hPolys[sR], inward_margin);
-                if (nowL && nowR)
-                    break;
-            }
-
-            // Write back the (possibly adjusted) point
-            route_m[idx] = p;
-
-            // Final check
-            bool finalL = inside_with_margin(p, hPolys[sL], inward_margin);
-            bool finalR = inside_with_margin(p, hPolys[sR], inward_margin);
-            if (!(finalL && finalR))
-            {
-                all_ok = false; // still outside after POCS; keep going to fix others
-            }
-        }
-
-        return all_ok;
-    }
-
-    // Degree-5 Bezier evaluator (pos,vel,acc,jer) at u∈[0,1] for one segment
-    static inline void evalBezier5_PVAJ(const std::array<Eigen::Vector3d, 6> &CP,
-                                        double T, double u,
-                                        Eigen::Vector3d &p,
-                                        Eigen::Vector3d &v,
-                                        Eigen::Vector3d &a,
-                                        Eigen::Vector3d &j)
-    {
-        const double om = 1.0 - u;
-
-        // position
-        const double b0 = std::pow(om, 5);
-        const double b1 = 5 * u * std::pow(om, 4);
-        const double b2 = 10 * u * u * std::pow(om, 3);
-        const double b3 = 10 * std::pow(u, 3) * om * om;
-        const double b4 = 5 * std::pow(u, 4) * om;
-        const double b5 = std::pow(u, 5);
-        p = b0 * CP[0] + b1 * CP[1] + b2 * CP[2] + b3 * CP[3] + b4 * CP[4] + b5 * CP[5];
-
-        // forward differences
-        std::array<Eigen::Vector3d, 5> D1;
-        for (int i = 0; i < 5; ++i)
-            D1[i] = CP[i + 1] - CP[i];
-        std::array<Eigen::Vector3d, 4> D2;
-        for (int i = 0; i < 4; ++i)
-            D2[i] = D1[i + 1] - D1[i];
-        std::array<Eigen::Vector3d, 3> D3;
-        for (int i = 0; i < 3; ++i)
-            D3[i] = D2[i + 1] - D2[i];
-
-        const double invT = 1.0 / std::max(T, 1e-9);
-        const double invT2 = invT * invT;
-        const double invT3 = invT2 * invT;
-
-        // velocity (deg-4)
-        const double c0 = std::pow(om, 4);
-        const double c1 = 4 * u * std::pow(om, 3);
-        const double c2 = 6 * u * u * om * om;
-        const double c3 = 4 * std::pow(u, 3) * om;
-        const double c4 = std::pow(u, 4);
-        v = 5.0 * invT * (c0 * D1[0] + c1 * D1[1] + c2 * D1[2] + c3 * D1[3] + c4 * D1[4]);
-
-        // acceleration (deg-3)
-        const double d0 = std::pow(om, 3);
-        const double d1 = 3 * u * om * om;
-        const double d2 = 3 * u * u * om;
-        const double d3 = std::pow(u, 3);
-        a = 20.0 * invT2 * (d0 * D2[0] + d1 * D2[1] + d2 * D2[2] + d3 * D2[3]);
-
-        // jerk (deg-2)
-        const double e0 = om * om;
-        const double e1 = 2 * u * om;
-        const double e2 = u * u;
-        j = 60.0 * invT3 * (e0 * D3[0] + e1 * D3[1] + e2 * D3[2]);
     }
 
     // GCOPTER: sample [0, T_tot] every dt and write CSV (now with ω, tilt, thrust)

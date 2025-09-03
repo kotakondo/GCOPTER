@@ -49,6 +49,13 @@ python3 src/GCOPTER/gcopter/scripts/bench_simple.py
 python3 src/GCOPTER/gcopter/scripts/bench_sweep.py
 ```
 
+### Useful Scripts
+
+- `analyze_data.ipynb`: Jupyter notebook for analyzing and visualizing the benchmark results.
+- `bench_simple.py`: Script for running a simple benchmark case.
+- `bench_sweep.py`: Script for running a sweep benchmark case.
+- `bag_id_shift.py`: Script for shifting the ID's in ROS bag files so that we can visualize multiple runs in one Rviz without marker ID conflicts.
+
 ## About GCOPTER
 
 __Author__: [Zhepei Wang](https://zhepeiwang.github.io) and [Fei Gao](https://scholar.google.com/citations?hl=en&user=4RObDv0AAAAJ) from [ZJU FAST Lab](http://zju-fast.com).

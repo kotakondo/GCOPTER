@@ -2,13 +2,9 @@
 """
 bag_id_shift.py — clone a rosbag2 while offsetting Marker IDs per "run"
 
-Usage:
-  python3 bag_id_shift.py \
-    --in /path/to/input_bag_dir \
-    --out /path/to/output_bag_dir \
-    --gap-sec 1.0 \
-    --id-offset 100000 \
-    --append-ns
+Example Usage:
+  python3 src/GCOPTER/gcopter/scripts/bag_id_shift.py  --in /media/kkondo/lucas_pro/mighty_gcopter_bench/sweep_bench/data9/case_00000_v1.00_jw1e-1/bag   --out /media/kkondo/lucas_pro/mighty_gcopter_bench/sweep_bench/data9/case_00000_v1.00_jw1e-1/bag_idshift   --gap-sec 2.0   --id-offset 100000   --append-ns
+
 
 What it does:
 - Iterates messages chronologically from the input bag.

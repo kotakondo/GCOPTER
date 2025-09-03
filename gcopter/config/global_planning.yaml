@@ -47,7 +47,7 @@
     sfc_range:                7.0
 
     # time out for optimization [ms]
-    opt_timeout_ms:           -1.0   # no decimal point since this will be converted to int. Set to negative value for no timeout
+    opt_timeout_ms:           10.0   # no decimal point since this will be converted to int. Set to negative value for no timeout
 
     # L-BFGS parameters
     lbfgs_mem_size:           256 #256
@@ -58,4 +58,4 @@
     lbfgs_g_epsilon:          1.0e-5
 
     # Use scaled cost and gradient
-    use_scaled_cost:          False
+    use_scaled_cost:          True

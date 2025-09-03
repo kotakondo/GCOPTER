@@ -6,7 +6,6 @@ import os
 import time
 import signal
 
-# ---------- small utils ----------
 def start_proc(cmd, name):
     """
     Start a process in its own session (process group) so we can kill
@@ -159,9 +158,9 @@ def main():
             print(f"[bench] done run {run_idx:03d} | wall {wall:.2f}s | rc={rc}")
 
             # Optional: if a run fails, break early
-            # if rc != 0:
-            #     print(f"[bench] non-zero rc {rc}, aborting remaining runs.")
-            #     break
+            if rc != 0:
+                print(f"[bench] non-zero rc {rc}, aborting remaining runs.")
+                break
 
     except KeyboardInterrupt:
         print("\n[bench] Ctrl-C — shutting down.")
