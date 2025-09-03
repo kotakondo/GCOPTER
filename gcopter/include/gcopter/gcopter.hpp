@@ -104,6 +104,7 @@ namespace gcopter
         inline void setTimeBudgetMs(double ms)
         {
             time_budget_ms_ = ms;
+            deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds((int)ms);
             time_budget_enabled_ = (ms > 0.0);
         }
 
@@ -892,8 +893,14 @@ namespace gcopter
         }
 
         inline double optimize_with_timeout(Trajectory<5> &traj,
-                               const double &relCostTol,
-                               double time_budget_ms /* <= 0 means no limit */)
+                               const double relCostTol,
+                               const double time_budget_ms,
+                               const int mem_size = 256,
+                               const int max_linesearch = 20,
+                               const int past = 3,
+                               const double min_step = 1e-32,
+                               const int max_iterations = 0,
+                               const double g_epsilon = 1e-5)
         {
             // Tell the solver whether we have a budget
             setTimeBudgetMs(time_budget_ms);
@@ -917,11 +924,12 @@ namespace gcopter
             best_f_ = std::numeric_limits<double>::infinity();
 
             double minCostFunctional;
-            lbfgs_params.mem_size = 256;
-            lbfgs_params.past = 3;
-            lbfgs_params.min_step = 1.0e-32;
-            lbfgs_params.max_iterations = 500;
-            lbfgs_params.g_epsilon = 1e-5;
+            lbfgs_params.mem_size = mem_size;
+            lbfgs_params.max_linesearch = max_linesearch;
+            lbfgs_params.past = past;
+            lbfgs_params.min_step = min_step;
+            lbfgs_params.max_iterations = max_iterations;
+            lbfgs_params.g_epsilon = g_epsilon;
             lbfgs_params.delta = relCostTol;
 
             // save initial guess
@@ -932,7 +940,7 @@ namespace gcopter
                 x,
                 minCostFunctional,
                 &GCOPTER_PolytopeSFC::costFunctional,     // fused f+g (already in GCOPTER)
-                &GCOPTER_PolytopeSFC::stepBoundTimeGuard, // new (can be nullptr if you prefer)
+                nullptr, // new (can be nullptr if you prefer)
                 &GCOPTER_PolytopeSFC::progressTimeGuard,  // new
                 this,
                 lbfgs_params);

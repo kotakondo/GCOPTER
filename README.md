@@ -1,8 +1,8 @@
-# GCOPTER ROS2
+# MIGHTY vs GCOPTER Benchmarking
 
-This is a revised version for benchmarking used by Kumar Lab. 
-
-## Usage
+This is a revised version for benchmarking based on Kumar Lab's repo (https://github.com/yuwei-wu/GCOPTER.git).
+ 
+## Usage 
 
 ### Prerequisites
 
@@ -14,26 +14,42 @@ sudo apt install ros-humble-pcl-conversions ros-humble-pcl-ros
 sudo apt install libpcl-dev libompl-dev
 ```
 
-### Build and Run
+### Build
 
 ```bash
-mkdir -p test_ws/src
-cd test_ws/src
-git clone -b ros2 https://github.com/yuwei-wu/GCOPTER.git
+mkdir -p gcopter_ws/src
+cd gcopter_ws/src
+git clone https://github.com/kotakondo/GCOPTER.git
 cd ../
 colcon build --cmake-args -DCMAKE_INSTALL_PREFIX="$HOME/.local" -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++ ..
 source install/setup.bash
-ros2 launch gcopter global_planning.launch.py
 ```
 
+### Advanced (FAST) Build Options
 
+First export the number of parallel workers (optional, default: number of CPU cores):
+```bash
+export J=$(nproc)  # number of parallel workers
+```
 
-__GCOPTER__ is an efficient and versatile multicopter trajectory optimizer built upon a novel sparse trajectory representation named [__MINCO__](https://arxiv.org/pdf/2103.00190.pdf). __User-defined state-input constraints__ for dynamics involving [__nonlinear drag effects__](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/misc/flatness.pdf) are supported.
+Then build with the following command:
+```bash
+colcon build --merge-install --symlink-install   --parallel-workers $J   --cmake-args     -DCMAKE_BUILD_TYPE=Release     -DBUILD_TESTING=OFF     -DCMAKE_UNITY_BUILD=ON     -DCMAKE_C_COMPILER_LAUNCHER=ccache     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache     -DCMAKE_C_FLAGS_RELEASE="-O3 -march=native -pipe -flto=thin -DNDEBUG"     -DCMAKE_CXX_FLAGS_RELEASE="-O3 -march=native -pipe -flto=thin -DEIGEN_NO_DEBUG -DNDEBUG"     -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -Wl,--threads=$J -Wl,--thinlto-jobs=$J"     -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--threads=$J -Wl,--thinlto-jobs=$J"
+```
 
+### Run Benchmark (simple case)
 
-## About
+```bash
+python3 src/GCOPTER/gcopter/scripts/bench_simple.py
+```
 
-If our repo helps your academic projects, please cite our paper. Thank you!
+### Run Benchmark (complex case)
+
+```bash
+python3 src/GCOPTER/gcopter/scripts/bench_sweep.py
+```
+
+## About GCOPTER
 
 __Author__: [Zhepei Wang](https://zhepeiwang.github.io) and [Fei Gao](https://scholar.google.com/citations?hl=en&user=4RObDv0AAAAJ) from [ZJU FAST Lab](http://zju-fast.com).
 

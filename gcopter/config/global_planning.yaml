@@ -4,9 +4,9 @@
     TargetTopic:                '/goal_pose'
     DilateRadius:               0.5
     VoxelWidth:                 0.25
-    MapBound:                   [-35.0, 35.0, -35.0, 35.0, 0.0, 5.0]
-    TimeoutRRT:                 1.0
-    MaxVelMag:                  4.0
+    MapBound:                   [-15.0, 15.0, -15.0, 15.0, 0.0, 5.0]
+    TimeoutRRT:                 3.0
+    MaxVelMag:                  2.0
     MaxBdrMag:                  2.1
     MaxTiltAngle:               1.05
     MinThrust:                  2.0
@@ -17,7 +17,7 @@
     VertDrag:                   0.80
     ParasDrag:                  0.01
     SpeedEps:                   0.0001
-    WeightT:                    1e+2  
+    WeightT:                    1e+2
     ChiVec:                     [1.0e+4, 1.0e+4, 1.0e+4, 1.0e+4, 1.0e+5] # [pos, vel, omega, theta, thrust]
     SmoothingEps:               1.0e-2
     IntegralIntervs:            16
@@ -26,13 +26,13 @@
     SampleDt:                   0.01
 
     # MIGHTY-specific parameters
-    MIGHTYJerkWeight:           1.0e-3
-    MIGHTYWeightT:              5.0e-1
-    MIGHTYPosWeight:            1.0e0
-    MIGHTYVelWeight:            1.0e0
-    MIGHTYOmegaWeight:          1.0e0
-    MIGHTYThetaWeight:          1.0e0
-    MIGHTYThrustWeight:         1.0e0
+    MIGHTYJerkWeight:           1.0e-1
+    MIGHTYWeightT:              1.0e+2
+    MIGHTYPosWeight:            1.0e+4
+    MIGHTYVelWeight:            1.0e+4
+    MIGHTYOmegaWeight:          1.0e+4
+    MIGHTYThetaWeight:          1.0e+4
+    MIGHTYThrustWeight:         1.0e+5
     OrientSmoothWeight:         0.0
     TiltBiasWeight:             0.0
     TvarWeight:                 0.0
@@ -48,3 +48,14 @@
 
     # time out for optimization [ms]
     opt_timeout_ms:           -1.0   # no decimal point since this will be converted to int. Set to negative value for no timeout
+
+    # L-BFGS parameters
+    lbfgs_mem_size:           256 #256
+    max_linesearch:           64 #40
+    lbfgs_past:               3
+    lbfgs_min_step:           1.0e-32
+    lbfgs_max_iterations:     0
+    lbfgs_g_epsilon:          1.0e-5
+
+    # Use scaled cost and gradient
+    use_scaled_cost:          False

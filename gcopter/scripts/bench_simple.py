@@ -63,18 +63,18 @@ def main():
     ap.add_argument("--out_root", default="/media/kkondo/lucas_pro/mighty_gcopter_bench/simple_bench",
                     help="Root directory for cases (same default as bench_sweep.py)")
     ap.add_argument("--n_runs", type=int, default=100, help="How many repeated runs to execute")
-    ap.add_argument("--sleep_after_base", type=float, default=3.0, help="Seconds to wait after starting base.launch")
+    ap.add_argument("--sleep_after_base", type=float, default=1.0, help="Seconds to wait after starting base.launch")
     ap.add_argument("--case_timeout", type=float, default=0.0,
                     help="Seconds to wait for each run before aborting (0 = no timeout)")
 
     # fixed parameters (no sweeping)
-    ap.add_argument("--max_vel", type=float, default=4.0, help="Fixed max velocity to pass to the benchmark")
+    ap.add_argument("--max_vel", type=float, default=1.0, help="Fixed max velocity to pass to the benchmark")
     ap.add_argument("--mighty_jerk_weight", type=str, default="1e0",
                     help="Fixed jerk weight to pass to the benchmark (string like 1e-3)")
 
     # start / goal
     ap.add_argument("--start", default="[0.0, 1.0, 1.0]")
-    ap.add_argument("--goal",  default="[-10.0, -10.0, 1.0]")
+    ap.add_argument("--goal",  default="[-7.0, -7.0, 1.0]")
 
     # sampling/col-check settings
     ap.add_argument("--sample_dt", default="0.01")

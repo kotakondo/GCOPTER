@@ -13,7 +13,7 @@ def launch_setup(context, *args, **kwargs):
     if use_simple:
         x_length, y_length, map_type, fractal, road_width = 20, 20, 3, 3, 5.0
     else:
-        x_length, y_length, map_type, fractal, road_width = 50, 50, 1, 1, 0.0
+        x_length, y_length, map_type, fractal, road_width = 25, 25, 1, 1, 0.0
 
     rviz_config_path = PathJoinSubstitution(
         [FindPackageShare('gcopter'), 'config', 'global_planning.rviz']

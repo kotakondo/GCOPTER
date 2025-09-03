@@ -11,14 +11,10 @@
 #include "gcopter/flatness.hpp"
 #include "gcopter/voxel_map.hpp"
 #include "gcopter/sfc_gen.hpp"
-
-// === MIGHTY / LBFGS solver ===
-#include <dynus/lbfgs_solver.hpp> // declares SolverLBFGS, planner_params_t, LinearConstraint3D, etc.
-
+#include <dynus/lbfgs_solver.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/float64.hpp>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -29,7 +25,6 @@
 #include <vector>
 #include <decomp_ros_msgs/msg/polyhedron_array.hpp>
 #include <decomp_rviz_plugins/data_ros_utils.hpp>
-
 #include <fstream>
 #if __cplusplus >= 201703L
 #include <filesystem>
@@ -103,6 +98,17 @@ struct Config
     // Time out for optimization
     double opt_timeout_ms; // milliseconds
 
+    // L-BFGS parameters
+    int lbfgs_mem_size;
+    int lbfgs_max_linesearch;
+    int lbfgs_past;
+    double lbfgs_min_step;
+    int lbfgs_max_iterations;
+    double lbfgs_g_epsilon;
+
+    // Use scaled cost and gradient
+    bool use_scaled_cost;
+
     // Benchmarking
     bool do_benchmark = false; // if false, just visualize once
 
@@ -150,6 +156,13 @@ struct Config
         node.declare_parameter("sfc_progress", 0.5);   // progress along the route for corridor generation
         node.declare_parameter("sfc_range", 3.0);      // range around
         node.declare_parameter("opt_timeout_ms", 5.0); // time out for optimization in milliseconds
+        node.declare_parameter("lbfgs_mem_size", 50);
+        node.declare_parameter("lbfgs_max_linesearch", 20);
+        node.declare_parameter("lbfgs_past", 3);
+        node.declare_parameter("lbfgs_min_step", 1.0e-32);
+        node.declare_parameter("lbfgs_max_iterations", 1000);
+        node.declare_parameter("lbfgs_g_epsilon", 1.0e-5);
+        node.declare_parameter("use_scaled_cost", true);
         node.declare_parameter("do_benchmark", false); // if false, just visualize once
 
         // Get parameters from the node
@@ -194,6 +207,13 @@ struct Config
         node.get_parameter("sfc_progress", sfc_progress);
         node.get_parameter("sfc_range", sfc_range);
         node.get_parameter("opt_timeout_ms", opt_timeout_ms);
+        node.get_parameter("lbfgs_mem_size", lbfgs_mem_size);
+        node.get_parameter("lbfgs_max_iterations", lbfgs_max_iterations);
+        node.get_parameter("lbfgs_past", lbfgs_past);
+        node.get_parameter("lbfgs_min_step", lbfgs_min_step);
+        node.get_parameter("lbfgs_max_iterations", lbfgs_max_iterations);
+        node.get_parameter("lbfgs_g_epsilon", lbfgs_g_epsilon);
+        node.get_parameter("use_scaled_cost", use_scaled_cost);
         node.get_parameter("do_benchmark", do_benchmark);
 
         // Print out the configuration
@@ -419,58 +439,84 @@ static Metrics computeMetricsGCOPTER_sampled_dt(const Trajectory<5> &traj, doubl
 }
 
 // Sample MIGHTY trajectory at a uniform dt and integrate speed and jerk-norm via trapezoid.
-static Metrics computeMetricsMIGHTY_sampled_dt(const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
-                                               const std::vector<double> &T,
-                                               double dt)
-{
-    Metrics M;
-    const int Mseg = (int)CP.size();
-    if (Mseg == 0)
-        return M;
+struct Kahan {
+    double s = 0.0, c = 0.0;
+    inline void add(double y) { double t=y-c, tmp=s+t; c=(tmp-s)-t; s=tmp; }
+    inline double value() const { return s; }
+};
 
-    // cumulative edges
+static Metrics computeMetricsMIGHTY_sampled_dt(
+    const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
+    const std::vector<double> &T,
+    double dt)
+{
+    Metrics M{};
+    const int Mseg = (int)CP.size();
+    if (Mseg == 0) return M;
+
+    // Edges
     std::vector<double> edges(Mseg + 1, 0.0);
-    for (int s = 0; s < Mseg; ++s)
-        edges[s + 1] = edges[s] + T[s];
+    for (int s = 0; s < Mseg; ++s) edges[s + 1] = edges[s] + T[s];
     const double Ttot = edges.back();
     M.time_s = Ttot;
 
     const double h = std::max(1e-6, dt);
     const int N = std::max(1, (int)std::ceil(Ttot / h));
 
-    // Helper to eval v/j at global time t
-    auto eval_vj = [&](double t) -> std::pair<Eigen::Vector3d, Eigen::Vector3d>
+    // Eval helper: returns (p, v, a, j)
+    auto eval_pvaj = [&](double t)
+        -> std::tuple<Eigen::Vector3d, Eigen::Vector3d,
+                      Eigen::Vector3d, Eigen::Vector3d>
     {
         t = std::clamp(t, 0.0, Ttot);
-        // find segment
-        int s = std::clamp(static_cast<int>(std::upper_bound(edges.begin(), edges.end(), t) - edges.begin()) - 1, 0, Mseg - 1);
+        int s = (int)(std::upper_bound(edges.begin(), edges.end(), t) - edges.begin()) - 1;
+        s = std::clamp(s, 0, Mseg - 1);
         const double Ts = std::max(1e-9, T[s]);
-        const double u = (t - edges[s]) / Ts;
+        const double u  = std::clamp((t - edges[s]) / Ts, 0.0, 1.0);
         Eigen::Vector3d p, v, a, j;
-        evalBezier5_PVAJ(CP[s], Ts, std::clamp(u, 0.0, 1.0), p, v, a, j);
-        return {v, j};
+        evalBezier5_PVAJ(CP[s], Ts, u, p, v, a, j);
+        return {p, v, a, j};
     };
 
+    // Init at t=0
     double t_prev = 0.0;
-    auto [v_prev, j_prev] = eval_vj(0.0);
+    Eigen::Vector3d p_prev, v_prev, a_prev, j_prev;
+    std::tie(p_prev, v_prev, a_prev, j_prev) = eval_pvaj(0.0);
 
-    for (int i = 1; i <= N; ++i)
-    {
-        const double t = std::min(Ttot, i * h);
-        const double hi = t - t_prev;
+    // Track which segment t_prev is in, so we can split steps at seams
+    int k = 0; // edges[k] <= t_prev < edges[k+1]
 
-        auto [v, j] = eval_vj(t);
+    Kahan path_sum, jerk2_sum;
 
-        // path length: ∫ ||v|| dt
-        M.path_len += 0.5 * (v_prev.norm() + v.norm()) * hi;
+    for (int i = 1; i <= N; ++i) {
+        const double t_target = std::min(Ttot, i * h);
 
-        // jerk_cost: ∫ ||j|| dt   (change to j.squaredNorm() if you want ∫||j||^2)
-        M.jerk_cost += 0.5 * (j_prev.norm() + j.norm()) * hi; // <-- change to .squaredNorm() for L2^2
+        // Take one or two sub-steps so we never straddle a seam
+        while (t_prev < t_target - 1e-15) {
+            const double next_seam = (k < Mseg ? edges[k + 1] : Ttot);
+            const double t = std::min(t_target, next_seam);
+            const double hi = t - t_prev;
 
-        t_prev = t;
-        v_prev = v;
-        j_prev = j;
+            Eigen::Vector3d p, v, a, j;
+            std::tie(p, v, a, j) = eval_pvaj(t);
+
+            // Path length (chord sum): Σ ||p_i - p_{i-1}||
+            path_sum.add((p - p_prev).norm());
+
+            // Jerk L2^2: trapezoid on ||j||
+            jerk2_sum.add(0.5 * (j_prev.norm() + j.norm()) * hi);
+
+            // Advance
+            t_prev = t;
+            p_prev = p; v_prev = v; a_prev = a; j_prev = j;
+
+            // If we exactly hit a seam, move to the next segment
+            if (t >= next_seam - 1e-15 && k < Mseg) ++k;
+        }
     }
+
+    M.path_len  = path_sum.value();
+    M.jerk_cost = jerk2_sum.value();  // this is ∫||j||^2 dt
     return M;
 }
 
@@ -555,6 +601,7 @@ static MightyOut runMighty(
     const vec_Vecf<3> &global_wps,
     const PolyhedraV &vPolytopes,
     const Eigen::VectorXd &initial_xi,
+    const Eigen::VectorXd &init_times,
     const std::vector<LinearConstraint3D> &safe_corridor,
     const state &initial_state,
     const state &final_state,
@@ -572,10 +619,9 @@ static MightyOut runMighty(
     std::vector<std::shared_ptr<dynTraj>> obstacles; // none for now
 
     double t0 = 0.0, ig_ms = 0.0;
-    bool corridor_q_active = false;
     solver->prepareSolverForReplan(
-        t0, global_wps, safe_corridor, initial_xi, obstacles,
-        initial_state, final_state, ig_ms, vPolytopes, corridor_q_active, false); // :contentReference[oaicite:3]{index=3}
+        t0, global_wps, safe_corridor, initial_xi, init_times, obstacles,
+        initial_state, final_state, ig_ms, vPolytopes, false); // :contentReference[oaicite:3]{index=3}
 
     // Get the single initial guess we just built
     const std::vector<Eigen::VectorXd> &z0_list = solver->getInitialGuesses();
@@ -588,13 +634,16 @@ static MightyOut runMighty(
 
     // 3) Optimize
     lbfgs::lbfgs_parameter_t lb;
-    // lb.mem_size = (int)z0.size();
-    lb.mem_size = 256;
-    lb.past = 3;
-    lb.min_step = 1.0e-32;
-    lb.max_iterations = 500;
-    lb.g_epsilon = 1.0e-5;       // gradient tolerance
+    lb.mem_size = cfg.lbfgs_mem_size;
+    lb.max_linesearch = cfg.lbfgs_max_linesearch;
+    lb.past = cfg.lbfgs_past;
+    lb.min_step = cfg.lbfgs_min_step;
+    lb.max_iterations = cfg.lbfgs_max_iterations;
+    lb.g_epsilon = cfg.lbfgs_g_epsilon;       // gradient tolerance
     lb.delta = cfg.relCostTol; // relative cost tolerance
+
+    // Scale derivative variables?
+    solver->setScaleDerivatives(cfg.use_scaled_cost);
 
     Eigen::VectorXd zopt;
     double fopt = 0.0;
@@ -834,7 +883,7 @@ public:
             return;
         }
 
-        if (std::isinf(gcopter.optimize_with_timeout(traj, config.relCostTol, config.opt_timeout_ms)))
+        if (std::isinf(gcopter.optimize_with_timeout(traj, config.relCostTol, config.opt_timeout_ms, config.lbfgs_mem_size, config.lbfgs_max_linesearch, config.lbfgs_past, config.lbfgs_min_step, config.lbfgs_max_iterations, config.lbfgs_g_epsilon)))
         {
             RCLCPP_ERROR(this->get_logger(), "GCOPTER optimize failed.");
             return;
@@ -934,7 +983,7 @@ public:
 
         // Convert GCOPTER’s hPolys to MIGHTY constraints
         std::vector<LinearConstraint3D> l_constraints = toLinearConstraints(hPolys);
-        MightyOut M_mighty = runMighty(route_m, vPolys, initial_xi, l_constraints, init_state, goal_state, mighty_cfg, config, physicalParams);
+        MightyOut M_mighty = runMighty(route_m, vPolys, initial_xi, init_times, l_constraints, init_state, goal_state, mighty_cfg, config, physicalParams);
 
         // Draw MIGHTY trajectory in green, with its own namespace
         visualizer.visualizeBezier(M_mighty.CP, M_mighty.T, /*ns=*/"mighty", /*width=*/0.06,

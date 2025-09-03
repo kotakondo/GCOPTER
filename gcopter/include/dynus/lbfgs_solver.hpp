@@ -105,12 +105,23 @@ namespace lbfgs
         // ------------------------------
         // Functions
         // ------------------------------
+        void setScaleDerivatives(bool on) { scale_derivs_ = on; }
+        bool scaleDerivatives() const { return scale_derivs_; }
 
         void pushWaypointsByStaticCorridor(std::vector<Vec3> &wps);
         void getGlobalPath(vec_Vecf<3> &global_path);
         // Computes objective and gradient in one call, reusing a single reconstruct.
         double evaluateObjectiveAndGradientFused(const Eigen::VectorXd &z, Eigen::VectorXd &grad);
         double evaluateObjectiveAndGradient(const Eigen::VectorXd &z, Eigen::VectorXd &grad);
+
+        inline int vhatOffset(int i) const
+        { // i in [0..M_]
+            return (i <= 0 || i >= M_) ? -1 : offVhat_ + 3 * (i - 1);
+        }
+        inline int ahatOffset(int i) const
+        {
+            return (i <= 0 || i >= M_) ? -1 : offAhat_ + 3 * (i - 1);
+        }
 
         // -----------------------------------------------------------------------------
 
@@ -260,12 +271,12 @@ namespace lbfgs
                                     const vec_Vec3f &global_wps,
                                     const std::vector<LinearConstraint3D> &safe_corridor,
                                     const Eigen::VectorXd &initial_xi,
+                                    const Eigen::VectorXd &init_times,
                                     const std::vector<std::shared_ptr<dynTraj>> &obstacles,
                                     const state &initial_state,
                                     const state &goal_state,
                                     double &initial_guess_computation_time,
                                     const PolyhedraV &vPolys,
-                                    bool corridor_q_active,
                                     bool use_multiple_initial_guesses = true);
 
         bool extractSeamQFromInitialXi(
@@ -275,8 +286,6 @@ namespace lbfgs
         double centralDiff(const VecXd &z,
                            const VecXd &d,
                            double eps_base);
-
-        void projectDirectionToFreeVars(Eigen::VectorXd &d) const;
 
         void checkGradDirectional(const VecXd &z0,
                                   int num_dirs /*=8*/,
@@ -604,6 +613,24 @@ namespace lbfgs
 
         // --- layout state ---
         bool corridor_q_active_ = true; // true when we use [P0 | q's | PM | v̂ | â | τ]
+
+        // pre-allocate for vectors
+        // scratch reused by every f/g eval
+        mutable std::vector<Vec3> P_s_, V_s_, A_s_;
+        mutable std::vector<std::array<Vec3,6>> CP_s_;
+        mutable std::vector<double> T_s_;
+        mutable std::vector<Vec3> gP_s_, gV_s_, gA_s_;
+        mutable std::vector<double> gT_s_;
+
+        // in class SolverLBFGS (private:)
+        bool scale_derivs_ = true;  // default = current behavior (v̂ = T̄ V, â = T̄² A)
+
+        // -----------------------------------------------------------------------------
+
+        inline void reconstruct_inplace(const VecXd& z) const {
+            reconstruct(z, P_s_, V_s_, A_s_, CP_s_, T_s_);
+        }
+
 
         inline bool useCorridorLayout() const { return corridor_q_active_; }
 
