@@ -35,7 +35,7 @@ def launch_setup(context, *args, **kwargs):
                 'z_length': 5,
                 'type': map_type,
                 'complexity': 0.025,
-                'fill': 0.3,
+                'fill': 0.2,
                 'fractal': fractal,
                 'attenuation': 0.1,
                 'road_width': road_width,

@@ -4,7 +4,7 @@
     TargetTopic:                '/goal_pose'
     DilateRadius:               0.5
     VoxelWidth:                 0.25
-    MapBound:                   [-15.0, 15.0, -15.0, 15.0, 0.0, 5.0]
+    MapBound:                   [-20.0, 20.0, -20.0, 20.0, 0.0, 5.0]
     TimeoutRRT:                 3.0
     MaxVelMag:                  2.0
     MaxBdrMag:                  2.1
@@ -20,19 +20,20 @@
     WeightT:                    1e+2
     ChiVec:                     [1.0e+4, 1.0e+4, 1.0e+4, 1.0e+4, 1.0e+5] # [pos, vel, omega, theta, thrust]
     SmoothingEps:               1.0e-2
-    IntegralIntervs:            16
-    RelCostTol:                 1.0e-6
+    IntegralIntervs:            32
+    RelCostTol:                 1.0e-5
     ExportCSVDir:               '/home/kkondo/data/gcopter_csv'
     SampleDt:                   0.01
 
     # MIGHTY-specific parameters
-    MIGHTYJerkWeight:           1.0e-1
+    MIGHTYJerkWeight:           1.0e-5
     MIGHTYWeightT:              1.0e+2
     MIGHTYPosWeight:            1.0e+4
     MIGHTYVelWeight:            1.0e+4
     MIGHTYOmegaWeight:          1.0e+4
     MIGHTYThetaWeight:          1.0e+4
     MIGHTYThrustWeight:         1.0e+5
+    MIGHTYINITI_TURNBF:         30.0 # degrees
     OrientSmoothWeight:         0.0
     TiltBiasWeight:             0.0
     TvarWeight:                 0.0
@@ -47,7 +48,7 @@
     sfc_range:                7.0
 
     # time out for optimization [ms]
-    opt_timeout_ms:           10.0   # no decimal point since this will be converted to int. Set to negative value for no timeout
+    opt_timeout_ms:           -1.0   # no decimal point since this will be converted to int. Set to negative value for no timeout
 
     # L-BFGS parameters
     lbfgs_mem_size:           256 #256

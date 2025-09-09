@@ -161,7 +161,6 @@ Visualization Manager:
           Name: spheres
           Namespaces:
             StartGoal: true
-            spheres: true
           Topic:
             Depth: 5
             Durability Policy: Volatile
@@ -184,10 +183,10 @@ Visualization Manager:
             Value: /visualizer/waypoints
           Value: true
         - Class: rviz_default_plugins/Marker
-          Enabled: true
+          Enabled: false
           Name: trajectory
           Namespaces:
-            trajectory: true
+            {}
           Topic:
             Depth: 5
             Durability Policy: Volatile
@@ -195,7 +194,7 @@ Visualization Manager:
             History Policy: Keep Last
             Reliability Policy: Reliable
             Value: /visualizer/trajectory
-          Value: true
+          Value: false
         - Class: rviz_default_plugins/Marker
           Enabled: true
           Name: vel text
@@ -213,7 +212,7 @@ Visualization Manager:
           Enabled: true
           Name: mighty spheres
           Namespaces:
-            mighty_curr: true
+            {}
           Topic:
             Depth: 5
             Durability Policy: Volatile
@@ -252,7 +251,7 @@ Visualization Manager:
           Enabled: true
           Name: mighty vel text
           Namespaces:
-            mighty_speed: true
+            {}
           Topic:
             Depth: 5
             Durability Policy: Volatile
@@ -326,25 +325,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 51.18719482421875
+      Distance: 29.81902313232422
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: -10.0255708694458
-        Y: -3.7430241107940674
-        Z: 0.34909701347351074
+        X: -8.869054794311523
+        Y: -5.145409107208252
+        Z: 1.9286394119262695
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.9603986740112305
+      Pitch: 1.135398507118225
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz)
-      Yaw: 1.495400309562683
+      Yaw: 2.375408172607422
     Saved: ~
 Window Geometry:
   Displays:

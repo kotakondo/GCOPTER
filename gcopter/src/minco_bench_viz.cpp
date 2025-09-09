@@ -81,6 +81,7 @@ struct Config
     double mightyOmegaWeight;  // w_omega for MIGHTY (LBFGS)
     double mightyThetaWeight;  // w_theta for MIGHTY (LBFGS)
     double mightyThrustWeight; // w_thrust for MIGHTY (LBFGS
+    double mightyINITITurnBF; // initial turn buffer in degrees
     double mightyJerkWeight;   // Jerk weight for MIGHTY (LBFGS
     double orientSmoothWeight; // w_orient_smooth
     double tiltBiasWeight;     // w_tilt_bias
@@ -151,6 +152,7 @@ struct Config
         node.declare_parameter("MIGHTYOmegaWeight", 1.0e+4);     // w_omega for MIGHTY (LBFGS)
         node.declare_parameter("MIGHTYThetaWeight", 1.0e+4);     // w_theta for MIGHTY (LBFGS)
         node.declare_parameter("MIGHTYThrustWeight", 1.0e+5);    // w_thrust for MIGHTY (LBFGS)
+        node.declare_parameter("MIGHTYINITI_TURNBF", 15.0);      // initial turn buffer in degrees
         node.declare_parameter("MIGHTYJerkWeight", 0.1);         // Jerk weight for MIGHTY (LBFGS)
         node.declare_parameter("CollisionDt", 0.01);
         node.declare_parameter("sfc_progress", 0.5);   // progress along the route for corridor generation
@@ -202,6 +204,7 @@ struct Config
         node.get_parameter("MIGHTYOmegaWeight", mightyOmegaWeight);
         node.get_parameter("MIGHTYThetaWeight", mightyThetaWeight);
         node.get_parameter("MIGHTYThrustWeight", mightyThrustWeight);
+        node.get_parameter("MIGHTYINITI_TURNBF", mightyINITITurnBF);
         node.get_parameter("MIGHTYJerkWeight", mightyJerkWeight);
         node.get_parameter("CollisionDt", collisionDt);
         node.get_parameter("sfc_progress", sfc_progress);
@@ -945,7 +948,7 @@ public:
         mighty_cfg.verbose = true;
         mighty_cfg.V_nom = config.maxVelMag;
         mighty_cfg.V_max = config.maxVelMag;
-        mighty_cfg.A_max = 0.0;                                           // not used here
+        mighty_cfg.A_max = 100.0;                                           // not used here
         mighty_cfg.J_max = 0.0;                                           // not used here
         mighty_cfg.time_weight = config.mightyWeightT;                    // you can tune this
         mighty_cfg.dyn_weight = 0.0;                                      // no moving obstacles in this bench
@@ -961,7 +964,7 @@ public:
         mighty_cfg.Tmin_weight = config.TminWeight;                       // w_Tmin
         mighty_cfg.Tmin_plan = config.TminPlan;                           // Tmin for planning
         mighty_cfg.num_dyn_obst_samples = 64;
-        mighty_cfg.init_turn_bf = 40.0; // degrees
+        mighty_cfg.init_turn_bf = config.mightyINITITurnBF; // degrees
         mighty_cfg.Co = 0.0;            // corridor “soft margin”
         mighty_cfg.Cw = 0.40;           // dyn obstacle radius (unused here)
         mighty_cfg.BIG = 1e9;
@@ -998,9 +1001,9 @@ public:
         MightyOut M_mighty = runMighty(route_m, vPolys, initial_xi, init_times, l_constraints, init_state, goal_state, mighty_cfg, config, physicalParams);
 
         // === 10) Draw MIGHTY trajectory in green, with its own namespace
-        visualizer.visualizeBezier(M_mighty.CP, M_mighty.T, /*ns=*/"mighty", /*width=*/0.06,
+        visualizer.visualizeBezier(M_mighty.CP, M_mighty.T, /*ns=*/"mighty", /*width=*/0.3,
                                    /*samples=*/120, /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
-                                   /*frame_id=*/"world");
+                                   /*frame_id=*/"odom", config.maxVelMag);
 
         // === 11) Cache cumulative edges for fast lookup
         mightyEdges_.assign(M_mighty.T.size() + 1, 0.0);
@@ -1088,7 +1091,7 @@ public:
         if (!mightyKnots_.empty())
             visualizer.visualizePoints(mightyKnots_, 0.35f, 0.f, 1.f, 0.f, 1.f, "odom", "mighty_knots", 0.0);
         if (!M_mighty_.CP.empty())
-            visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, "mighty", 0.06, 120, 0.f, 1.f, 0.f, 1.f, "odom");
+            visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, "mighty", 0.3, 120, 0.f, 1.f, 0.f, 1.f, "odom", config.maxVelMag);
     }
 
     void scheduleExitIfBenchmark_()
@@ -1214,9 +1217,9 @@ public:
             return;
         }
 
-        visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, /*ns=*/"mighty", /*width=*/0.06,
+        visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, /*ns=*/"mighty", /*width=*/0.3,
                                    /*samples=*/120, /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
-                                   /*frame_id=*/"odom");
+                                   /*frame_id=*/"odom", config.maxVelMag);
     }
 
     // GCOPTER: sample [0, T_tot] every dt and write CSV (now with ω, tilt, thrust)

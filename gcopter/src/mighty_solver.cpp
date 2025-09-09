@@ -566,6 +566,80 @@ void SolverLBFGS::pushWaypointsByStaticCorridor(std::vector<Vec3> &wps)
 
 // -----------------------------------------------------------------------------
 
+// sign function
+template <typename T>
+int sgn(T val)
+{
+return (T(0) < val) - (val < T(0));
+}
+
+// -----------------------------------------------------------------------------
+
+double SolverLBFGS::getMinTimeDoubleIntegrator1D(const double p0, const double v0, const double pf, const double vf,
+                                    const double v_max, const double a_max)
+{
+    // The notation of this function is based on the paper "Constrained time-optimal control of double integrator system and its application in MPC"
+    // https://iopscience.iop.org/article/10.1088/1742-6596/783/1/012024
+
+    double x1 = v0;
+    double x2 = p0;
+    double x1r = vf;
+    double x2r = pf;
+
+    double k1 = a_max; // Note that the paper uses u\in[-1, 1].But setting k1 to a_max has the same effect k2 = 1.0;
+    double k2 = 1.0;
+
+    double x1_bar = v_max;
+
+    double B = (k2 / (2 * k1)) * sgn(-x1 + x1r) * (pow(x1, 2) - pow(x1r, 2)) + x2r;
+    double C = (k2 / (2 * k1)) * (pow(x1, 2) + pow(x1r, 2)) - (k2 / k1) * pow(x1_bar, 2) + x2r;
+    double D = (-k2 / (2 * k1)) * (pow(x1, 2) + pow(x1r, 2)) + (k2 / k1) * pow(x1_bar, 2) + x2r;
+
+    double time;
+
+    if ((x2 <= B) && (x2 >= C))
+    {
+        time = (-k2 * (x1 + x1r) +
+                2 * sqrt(pow(k2, 2) * pow(x1, 2) - k1 * k2 * ((k2 / (2 * k1)) * (pow(x1, 2) - pow(x1r, 2)) + x2 - x2r))) /
+               (k1 * k2);
+    }
+
+    else if ((x2 <= B) && (x2 < C))
+    {
+        time = (x1_bar - x1 - x1r) / k1 + (pow(x1, 2) + pow(x1r, 2)) / (2 * k1 * x1_bar) + (x2r - x2) / (k2 * x1_bar);
+    }
+
+    else if ((x2 > B) && (x2 <= D))
+    {
+        time = (k2 * (x1 + x1r) +
+                2 * sqrt(pow(k2, 2) * pow(x1, 2) + k1 * k2 * ((k2 / (2 * k1)) * (-pow(x1, 2) + pow(x1r, 2)) + x2 - x2r))) /
+               (k1 * k2);
+    }
+
+    else
+    { // (x2 > B) && (x2 > D)
+
+        time = (x1_bar + x1 + x1r) / k1 + (pow(x1, 2) + pow(x1r, 2)) / (2 * k1 * x1_bar) + (-x2r + x2) / (k2 * x1_bar);
+    }
+
+    return time;
+}
+
+double SolverLBFGS::getMinTimeDoubleIntegrator3D(const Eigen::Vector3d &p0, const Eigen::Vector3d &v0, const Eigen::Vector3d &pf,
+                                    const Eigen::Vector3d &vf, const Eigen::Vector3d &v_max,
+                                    const Eigen::Vector3d &a_max)
+{
+    double min_x = getMinTimeDoubleIntegrator1D(p0.x(), v0.x(), pf.x(), vf.x(), v_max.x(), a_max.x());
+    double min_y = getMinTimeDoubleIntegrator1D(p0.y(), v0.y(), pf.y(), vf.y(), v_max.y(), a_max.y());
+    double min_z = getMinTimeDoubleIntegrator1D(p0.z(), v0.z(), pf.z(), vf.z(), v_max.z(), a_max.z());
+
+    double min_time = std::max({min_x, min_y, min_z}); // Note that it's the maximum of all the axes
+
+    return min_time;
+}
+
+// -----------------------------------------------------------------------------
+
 void SolverLBFGS::prepareSolverForReplan(double t0,
                                          const vec_Vec3f &global_wps,
                                          const std::vector<LinearConstraint3D> &safe_corridor,
@@ -663,16 +737,60 @@ void SolverLBFGS::prepareSolverForReplan(double t0,
 
     // ---- cheap segment times, then V/A ----
     std::vector<double> T;
-    T.reserve(M_);
-    for (int i = 0; i < M_; ++i)
-    {
-        double dist = (global_wps_[i + 1] - global_wps_[i]).norm();
-        T.push_back(std::max(1e-3, dist / V_max_));
-    }
+    // T.reserve(M_);
+    // for (int i = 0; i < M_; ++i)
+    // {
+    //     double dist = (global_wps_[i + 1] - global_wps_[i]).norm();
+    //     T.push_back(std::max(1e-3, dist / V_max_));
+    // }
 
     std::vector<Vec3> P(global_wps_.begin(), global_wps_.end());
+
+    // Set velocity to v_max to the direction of the segment
+    // std::vector<Vec3> V(M_ + 1, Vec3::Zero());
+    // // Set the initial and final velocity
+    // V[0] = v0_;
+    // V[M_] = vf_;
+    // for (int i = 1; i < M_; ++i)
+    // {
+    //     Vec3 dir = (P[i + 1] - P[i - 1]).normalized();
+    //     V[i] = dir * V_max_;
+    // }
+    // // Find min jerk acceleration
+    // std::vector<Vec3> A;
+    // solveMinJerkAccOnlyClosedForm(global_wps_, T, V, a0_, af_, A);
+
     std::vector<Vec3> V, A;
-    solveMinJerkVelAcc(global_wps_, T, v0_, a0_, vf_, af_, V, A);
+    findInitialGuess(T, V, A);
+    
+    // std::vector<Vec3> V, A;
+    // solveMinJerkVelAcc(global_wps_, T, v0_, a0_, vf_, af_, V, A);
+    // // if velocity or acceleration at any interior waypoint is bigger than max, scale it down.
+    // for (int i = 1; i < M_; ++i)
+    // {
+    //     double vnorm = V[i].norm();
+    //     if (vnorm > V_max_)
+    //         V[i] *= (V_max_ / vnorm);
+
+    //     double anorm = A[i].norm();
+    //     if (anorm > A_max_)
+    //         A[i] *= (A_max_ / anorm);
+    // }
+
+    // // For this new velocity profile, recompute segment times
+    // Eigen::Vector3d v_max_vec = Eigen::Vector3d::Constant(V_max_);
+    // Eigen::Vector3d a_max_vec = Eigen::Vector3d::Constant(A_max_);
+    // for (int i = 0; i < M_; ++i)
+    // {
+    //     // use the 3D double-integrator time-optimal solution
+    //     std::cout << "[init] seg " << i << " from P" << P[i].transpose() << " V" << V[i].transpose()
+    //               << " to P" << P[i + 1].transpose() << " V" << V[i + 1].transpose() << "\n";
+    //     std::cout << "v_max=" << v_max_vec.transpose() << " a_max=" << a_max_vec.transpose() << "\n";
+    //     double Tmin = getMinTimeDoubleIntegrator3D(P[i], V[i], P[i + 1], V[i + 1], v_max_vec, a_max_vec);
+    //     std::cout << "[init] seg " << i << " Tmin=" << Tmin << " oldT=" << T[i] << "\n";
+    //     if (Tmin > T[i])
+    //         T[i] = Tmin;
+    // }
 
     // ---- pack z0 (uses xi blocks directly) ----
     Eigen::VectorXd z0;
@@ -1048,7 +1166,6 @@ void SolverLBFGS::findInitialGuess(
 
     // --- 4) per‐waypoint speeds and velocity vectors ---
     std::vector<double> s(M_ + 1);
-    std::vector<Vec3> v_vec(M_ + 1);
 
     s[0] = v0_.norm();
     s[M_] = vf_.norm();
@@ -1070,11 +1187,11 @@ void SolverLBFGS::findInitialGuess(
             factor = std::clamp(factor, 0.0, 1.0);
         }
 
-        s[i] = std::max(V_min_, factor * V_nom_);
+        s[i] = std::max(V_min_, factor * V_max_);
     }
 
     // build velocity vectors at each waypoint
-    v_vec[0] = dirs[0] * s[0];
+    V[0] = v0_;
     for (int i = 1; i < M_; ++i)
     {
         Vec3 bis = dirs[i - 1] + dirs[i];
@@ -1083,22 +1200,33 @@ void SolverLBFGS::findInitialGuess(
             bis /= n;
         else
             bis = dirs[i];
-        v_vec[i] = bis * s[i];
+        V[i] = bis * s[i];
     }
-    v_vec[M_] = dirs[M_ - 1] * s[M_];
-    v_vec[M_ - 1] *= second_to_last_vel_scale_;
+    V[M_] = vf_;
+
+    // if second to last waypoint is close to the last, scale down its velocity
+    // double d_last = (global_wps_[M_] - global_wps_[M_ - 1]).norm();
+    // if (d_last < 2.0)
+    // {
+    //     double f = d_last / 2.0;
+    //     f = std::clamp(f, 0.1, 1.0);
+    //     V[M_ - 1] *= f;
+    // }
 
     // --- 5) allocate time per segment using average vector velocity ---
     for (int i = 0; i < M_; ++i)
     {
         double dist = (global_wps_[i + 1] - global_wps_[i]).norm();
-        Vec3 v_avg = 0.5 * (v_vec[i] + v_vec[i + 1]);
+        Vec3 v_avg = 0.5 * (V[i] + V[i + 1]);
         double speed = std::max(V_min_, v_avg.norm());
         T.push_back(dist / speed);
     }
 
+    // --- 6) generate initial A ---
+    solveMinJerkAccOnlyClosedForm(global_wps_, T, V, a0_, af_, A);
+
     // --- 6) generate initial V, A via your min-jerk helper ---
-    solveMinJerkVelAcc(global_wps_, T, v0_, a0_, vf_, af_, V, A);
+    // solveMinJerkVelAcc(global_wps_, T, v0_, a0_, vf_, af_, V, A);
 }
 
 // -----------------------------------------------------------------------------
@@ -1273,6 +1401,129 @@ void SolverLBFGS::solveMinJerkVelAcc(
         V[i] = X.row(2 * (i - 1)).transpose(); // Vec3 = (3×1)
         // row 2*(i-1)+1 of X is the acceleration at junction i
         A[i] = X.row(2 * (i - 1) + 1).transpose();
+    }
+}
+
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Build H_acc (N×N) and b_acc (N×3) for the "accelerations only" min-jerk problem.
+// Unknown vector is [A1, A2, ..., A_{M-1}], each Ai is 3D.
+// Uses your K_r(T) and k_r(T,P0,P1).
+// -----------------------------------------------------------------------------
+void SolverLBFGS::assemble_H_b_acc_only(
+    const std::vector<Vec3> &wps,         // size M+1
+    const std::vector<double> &T,         // size M
+    const std::vector<Vec3> &V,           // size M+1 (ALL velocities fixed)
+    const Vec3 &a0, const Vec3 &af,       // fixed endpoint accelerations
+    Eigen::MatrixXd &H,                   // out: (N×N)
+    Eigen::MatrixXd &b                    // out: (N×3)
+)
+{
+    const int M = static_cast<int>(T.size());
+    const int N = M - 1;
+    if (N <= 0) {
+        H.resize(0, 0);
+        b.resize(0, 3);
+        return;
+    }
+
+    H = Eigen::MatrixXd::Zero(N, N);
+    b = Eigen::MatrixXd::Zero(N, 3);
+
+    for (int r = 0; r < M; ++r)
+    {
+        const Eigen::Matrix4d Kr = K_r(T[r]);  // 4×4 over [V_r, A_r, V_{r+1}, A_{r+1}]
+
+        // k_r as a (4×3) block, column-wise per dimension
+        Eigen::Matrix<double, 4, 3> kr;
+        for (int dim = 0; dim < 3; ++dim) {
+            const auto c = k_r(T[r], wps[r](dim), wps[r+1](dim)); // {k0,k1,k2,k3}
+            kr(0, dim) = c[0];
+            kr(1, dim) = c[1];
+            kr(2, dim) = c[2];
+            kr(3, dim) = c[3];
+        }
+
+        if (r == 0)
+        {
+            // Only A1 is unknown → row uses A_{r+1} (index 3 in Kr)
+            const int j = 0; // maps to A1
+            H(j, j) += Kr(3, 3);
+            // b_j += Kr[3,0]*V_r + Kr[3,2]*V_{r+1} + Kr[3,1]*a0 + k_r[3]
+            b.row(j) += (Kr(3, 0) * V[r].transpose()
+                      +  Kr(3, 2) * V[r+1].transpose()
+                      +  Kr(3, 1) * a0.transpose()
+                      +  kr.row(3));
+        }
+        else if (r == M - 1)
+        {
+            // Only A_{M-1} is unknown → row uses A_r (index 1 in Kr)
+            const int i = N - 1; // maps to A_{M-1}
+            H(i, i) += Kr(1, 1);
+            // b_i += Kr[1,0]*V_r + Kr[1,2]*V_{r+1} + Kr[1,3]*af + k_r[1]
+            b.row(i) += (Kr(1, 0) * V[r].transpose()
+                      +  Kr(1, 2) * V[r+1].transpose()
+                      +  Kr(1, 3) * af.transpose()
+                      +  kr.row(1));
+        }
+        else
+        {
+            // Both A_r and A_{r+1} are unknown
+            const int i = r - 1; // maps to A_r
+            const int j = r;     // maps to A_{r+1}
+
+            // Quadratic terms: (A_r, A_{r+1})
+            H(i, i) += Kr(1, 1);
+            H(j, j) += Kr(3, 3);
+            H(i, j) += Kr(1, 3);
+            H(j, i) += Kr(3, 1);
+
+            // Linear terms (velocities + constants)
+            // b_i += Kr[1,0]*V_r + Kr[1,2]*V_{r+1} + k_r[1]
+            b.row(i) += (Kr(1, 0) * V[r].transpose()
+                      +  Kr(1, 2) * V[r+1].transpose()
+                      +  kr.row(1));
+            // b_j += Kr[3,0]*V_r + Kr[3,2]*V_{r+1} + k_r[3]
+            b.row(j) += (Kr(3, 0) * V[r].transpose()
+                      +  Kr(3, 2) * V[r+1].transpose()
+                      +  kr.row(3));
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// Solve H_acc * a = -b_acc for interior accelerations,
+// then pack full A with A[0]=a0 and A[M]=af.
+// -----------------------------------------------------------------------------
+void SolverLBFGS::solveMinJerkAccOnlyClosedForm(
+    const std::vector<Vec3> &wps,       // size M+1
+    const std::vector<double> &T,       // size M
+    const std::vector<Vec3> &V,         // size M+1 (fixed)
+    const Vec3 &a0, const Vec3 &af,     // fixed endpoint accelerations
+    std::vector<Vec3> &A_out            // out: size M+1
+)
+{
+    const int M = static_cast<int>(T.size());
+    const int N = M - 1;
+
+    A_out.clear();
+    A_out.resize(M + 1);
+    A_out.front() = a0;
+    A_out.back()  = af;
+
+    if (N <= 0) return;  // no interior unknowns
+
+    Eigen::MatrixXd H, b;            // (N×N), (N×3)
+    assemble_H_b_acc_only(wps, T, V, a0, af, H, b);
+
+    // Solve H * X = -b, where X is (N×3) stacked [A1; ...; A_{M-1}]
+    Eigen::MatrixXd X = H.ldlt().solve(-b);
+
+    for (int i = 1; i <= M - 1; ++i) {
+        A_out[i] = X.row(i - 1).transpose(); // Vec3
     }
 }
 

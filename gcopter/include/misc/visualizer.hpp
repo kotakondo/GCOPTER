@@ -287,6 +287,116 @@ public:
     }
 
     // Sample and publish a degree-5 Bezier trajectory (CP[seg][0..5], durations T[seg])
+    // inline void visualizeBezier(
+    //     const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
+    //     const std::vector<double> &T,
+    //     const std::string &ns = "mighty", // use a different namespace than GCOPTER
+    //     double width = 0.06,
+    //     int samples_per_seg = 120,
+    //     float r = 0.0f, float g = 1.0f, float b = 0.0f, float a = 1.0f,
+    //     const std::string &frame_id = "odom" // set to your RViz fixed frame if different
+    // )
+    // {
+
+    //     if (!mighty_traj_pub_)
+    //         return;
+
+    //     auto bezier5 = [](double u)
+    //     {
+    //         const double w = 1.0 - u;
+    //         return std::array<double, 6>{
+    //             w * w * w * w * w,
+    //             5 * u * w * w * w * w,
+    //             10 * u * u * w * w * w,
+    //             10 * u * u * u * w * w,
+    //             5 * u * u * u * u * w,
+    //             u * u * u * u * u};
+    //     };
+
+    //     visualization_msgs::msg::Marker mk;
+    //     mk.header.stamp = rclcpp::Clock().now();
+    //     mk.header.frame_id = frame_id;
+    //     mk.ns = ns;
+    //     mk.id = 1; // fixed id per-namespace so a new publish replaces the old line
+    //     mk.type = visualization_msgs::msg::Marker::LINE_STRIP;
+    //     mk.action = visualization_msgs::msg::Marker::ADD;
+    //     mk.pose.orientation.w = 1.0;
+    //     mk.scale.x = 0.3;
+    //     mk.color.r = r;
+    //     mk.color.g = g;
+    //     mk.color.b = b;
+    //     mk.color.a = a;
+    //     mk.lifetime = rclcpp::Duration(0, 0); // persistent
+
+    //     mk.points.clear();
+    //     mk.points.reserve(CP.size() * (samples_per_seg + 1));
+
+    //     for (size_t s = 0; s < CP.size(); ++s)
+    //     {
+    //         const int N = std::max(4, samples_per_seg);
+    //         for (int k = 0; k <= N; ++k)
+    //         {
+    //             if (s > 0 && k == 0)
+    //                 continue; // avoid duplicating seam point
+    //             const double u = static_cast<double>(k) / N;
+    //             const auto b = bezier5(u);
+    //             Eigen::Vector3d p =
+    //                 b[0] * CP[s][0] + b[1] * CP[s][1] + b[2] * CP[s][2] +
+    //                 b[3] * CP[s][3] + b[4] * CP[s][4] + b[5] * CP[s][5];
+
+    //             geometry_msgs::msg::Point q;
+    //             q.x = p.x();
+    //             q.y = p.y();
+    //             q.z = p.z();
+    //             mk.points.emplace_back(q);
+    //         }
+    //     }
+
+    //     mighty_traj_pub_->publish(mk);
+    // }
+
+    std_msgs::msg::ColorRGBA getColorJet(double v, double vmin, double vmax)
+    {
+        std_msgs::msg::ColorRGBA c;
+        c.r = 1;
+        c.g = 1;
+        c.b = 1;
+        c.a = 1;
+        // white
+        double dv;
+
+        if (v < vmin)
+            v = vmin;
+        if (v > vmax)
+            v = vmax;
+        dv = vmax - vmin;
+
+        if (v < (vmin + 0.25 * dv))
+        {
+            c.r = 0;
+            c.g = 4 * (v - vmin) / dv;
+        }
+        else if (v < (vmin + 0.5 * dv))
+        {
+            c.r = 0;
+            c.b = 1 + 4 * (vmin + 0.25 * dv - v) / dv;
+        }
+        else if (v < (vmin + 0.75 * dv))
+        {
+            c.r = 4 * (v - vmin - 0.5 * dv) / dv;
+            c.b = 0;
+        }
+        else
+        {
+            c.g = 1 + 4 * (vmin + 0.75 * dv - v) / dv;
+            c.b = 0;
+        }
+
+        return (c);
+    }
+
+    // Sample and publish a degree-5 Bezier trajectory (CP[seg][0..5], durations T[seg])
+    // Colors are per-point using getColorJet(speed, 0, v_max_axis_or_auto).
     inline void visualizeBezier(
         const std::vector<std::array<Eigen::Vector3d, 6>> &CP,
         const std::vector<double> &T,
@@ -294,14 +404,15 @@ public:
         double width = 0.06,
         int samples_per_seg = 120,
         float r = 0.0f, float g = 1.0f, float b = 0.0f, float a = 1.0f,
-        const std::string &frame_id = "odom" // set to your RViz fixed frame if different
+        const std::string &frame_id = "odom", // set to your RViz fixed frame if different
+        double v_max_axis = -1.0              // pass par_.v_max here; if <=0, auto-scale to sampled max
     )
     {
-
-        if (!mighty_traj_pub_)
+        if (!mighty_traj_pub_ || CP.empty() || T.empty())
             return;
 
-        auto bezier5 = [](double u)
+        // Bernstein for degree-5 and degree-4
+        auto B5 = [](double u)
         {
             const double w = 1.0 - u;
             return std::array<double, 6>{
@@ -312,6 +423,43 @@ public:
                 5 * u * u * u * u * w,
                 u * u * u * u * u};
         };
+        auto B4 = [](double u)
+        {
+            const double w = 1.0 - u;
+            return std::array<double, 5>{
+                w * w * w * w,
+                4 * u * w * w * w,
+                6 * u * u * w * w,
+                4 * u * u * u * w,
+                u * u * u * u};
+        };
+
+        // First pass (optional): find max speed if v_max_axis not provided.
+        double vmax_used = v_max_axis;
+        if (vmax_used <= 0.0)
+        {
+            double vmax_obs = 1e-9;
+            for (size_t s = 0; s < CP.size(); ++s)
+            {
+                const int N = std::max(4, samples_per_seg);
+                const double Ts = (s < T.size()) ? std::max(T[s], 1e-9) : 1.0;
+                for (int k = 0; k <= N; ++k)
+                {
+                    if (s > 0 && k == 0)
+                        continue; // avoid duplicate seam point
+                    const double u = static_cast<double>(k) / N;
+
+                    // dp/du for degree-5 Bezier: 5 * sum_{i=0..4} (P_{i+1} - P_i) * B4_i(u)
+                    const auto b4 = B4(u);
+                    Eigen::Vector3d dpdu =
+                        5.0 * ((CP[s][1] - CP[s][0]) * b4[0] + (CP[s][2] - CP[s][1]) * b4[1] + (CP[s][3] - CP[s][2]) * b4[2] + (CP[s][4] - CP[s][3]) * b4[3] + (CP[s][5] - CP[s][4]) * b4[4]);
+
+                    const double speed = (dpdu / Ts).norm();
+                    vmax_obs = std::max(vmax_obs, speed);
+                }
+            }
+            vmax_used = vmax_obs;
+        }
 
         visualization_msgs::msg::Marker mk;
         mk.header.stamp = rclcpp::Clock().now();
@@ -321,35 +469,56 @@ public:
         mk.type = visualization_msgs::msg::Marker::LINE_STRIP;
         mk.action = visualization_msgs::msg::Marker::ADD;
         mk.pose.orientation.w = 1.0;
-        mk.scale.x = 0.3;
-        mk.color.r = r;
+        mk.scale.x = width; // use the provided width
+        mk.color.r = r;     // fallback (RViz uses per-point if sizes match)
         mk.color.g = g;
         mk.color.b = b;
         mk.color.a = a;
         mk.lifetime = rclcpp::Duration(0, 0); // persistent
 
         mk.points.clear();
+        mk.colors.clear();
         mk.points.reserve(CP.size() * (samples_per_seg + 1));
+        mk.colors.reserve(CP.size() * (samples_per_seg + 1));
 
         for (size_t s = 0; s < CP.size(); ++s)
         {
             const int N = std::max(4, samples_per_seg);
+            const double Ts = (s < T.size()) ? std::max(T[s], 1e-9) : 1.0;
+
             for (int k = 0; k <= N; ++k)
             {
                 if (s > 0 && k == 0)
                     continue; // avoid duplicating seam point
+
                 const double u = static_cast<double>(k) / N;
-                const auto b = bezier5(u);
+
+                const auto b5 = B5(u);
                 Eigen::Vector3d p =
-                    b[0] * CP[s][0] + b[1] * CP[s][1] + b[2] * CP[s][2] +
-                    b[3] * CP[s][3] + b[4] * CP[s][4] + b[5] * CP[s][5];
+                    b5[0] * CP[s][0] + b5[1] * CP[s][1] + b5[2] * CP[s][2] +
+                    b5[3] * CP[s][3] + b5[4] * CP[s][4] + b5[5] * CP[s][5];
+
+                const auto b4 = B4(u);
+                Eigen::Vector3d dpdu =
+                    5.0 * ((CP[s][1] - CP[s][0]) * b4[0] + (CP[s][2] - CP[s][1]) * b4[1] + (CP[s][3] - CP[s][2]) * b4[2] + (CP[s][4] - CP[s][3]) * b4[3] + (CP[s][5] - CP[s][4]) * b4[4]);
+                const double speed = (dpdu / Ts).norm();
 
                 geometry_msgs::msg::Point q;
                 q.x = p.x();
                 q.y = p.y();
                 q.z = p.z();
                 mk.points.emplace_back(q);
+
+                // Map speed -> color (warm = fast)
+                std_msgs::msg::ColorRGBA c = getColorJet(speed, 0.0, vmax_used);
+                mk.colors.emplace_back(c);
             }
+        }
+
+        // Sanity: ensure RViz uses per-point colors
+        if (mk.colors.size() != mk.points.size())
+        {
+            mk.colors.clear(); // fall back to uniform color if something went off
         }
 
         mighty_traj_pub_->publish(mk);
@@ -363,7 +532,7 @@ public:
                               const std::string &ns,
                               int id,
                               double ttl_sec,
-                                const std::string &planner = "gcopter")
+                              const std::string &planner = "gcopter")
     {
         visualization_msgs::msg::Marker m;
         m.header.stamp = rclcpp::Clock().now();
@@ -404,15 +573,14 @@ public:
         {
             RCLCPP_WARN(node_.get_logger(), "Unknown planner '%s' for text visualization", planner.c_str());
         }
-
     }
 
     inline void visualizePoints(const std::vector<Eigen::Vector3d> &pts,
-                                            float radius,
-                                            float r, float g, float b, float a,
-                                            const std::string &frame_id,
-                                            const std::string &ns,
-                                            double ttl_sec)
+                                float radius,
+                                float r, float g, float b, float a,
+                                const std::string &frame_id,
+                                const std::string &ns,
+                                double ttl_sec)
     {
         visualization_msgs::msg::Marker m;
         m.header.frame_id = frame_id;
@@ -442,12 +610,12 @@ public:
     }
 
     inline void visualizeSphereColor(const Eigen::Vector3d &p,
-                                                 float radius,
-                                                 float r, float g, float b, float a,
-                                                 const std::string &frame_id,
-                                                 const std::string &ns,
-                                                 int id,
-                                                 double ttl_sec)
+                                     float radius,
+                                     float r, float g, float b, float a,
+                                     const std::string &frame_id,
+                                     const std::string &ns,
+                                     int id,
+                                     double ttl_sec)
     {
         visualization_msgs::msg::Marker m;
         m.header.frame_id = frame_id;

@@ -105,6 +105,14 @@ namespace lbfgs
         // ------------------------------
         // Functions
         // ------------------------------
+
+        double getMinTimeDoubleIntegrator1D(const double p0, const double v0, const double pf, const double vf,
+                                                         const double v_max, const double a_max);
+
+        double getMinTimeDoubleIntegrator3D(const Eigen::Vector3d &p0, const Eigen::Vector3d &v0, const Eigen::Vector3d &pf,
+                                                         const Eigen::Vector3d &vf, const Eigen::Vector3d &v_max,
+                                                         const Eigen::Vector3d &a_max);
+
         void setScaleDerivatives(bool on) { scale_derivs_ = on; }
         bool scaleDerivatives() const { return scale_derivs_; }
 
@@ -133,6 +141,25 @@ namespace lbfgs
          * @return   Scalar value of the objective at z
          */
         double evaluateObjective(const VecXd &z);
+
+        // -----------------------------------------------------------------------------
+
+        void assemble_H_b_acc_only(
+            const std::vector<Vec3> &wps,         // size M+1
+            const std::vector<double> &T,         // size M
+            const std::vector<Vec3> &V,           // size M+1 (ALL velocities fixed)
+            const Vec3 &a0, const Vec3 &af,       // fixed endpoint accelerations
+            Eigen::MatrixXd &H,                   // out: (N×N)
+            Eigen::MatrixXd &b                    // out: (N×3)
+        );
+
+        void solveMinJerkAccOnlyClosedForm(
+            const std::vector<Vec3> &wps,       // size M+1
+            const std::vector<double> &T,       // size M
+            const std::vector<Vec3> &V,         // size M+1 (fixed)
+            const Vec3 &a0, const Vec3 &af,     // fixed endpoint accelerations
+            std::vector<Vec3> &A_out            // out: size M+1
+        );
 
         // -----------------------------------------------------------------------------
 
@@ -617,20 +644,20 @@ namespace lbfgs
         // pre-allocate for vectors
         // scratch reused by every f/g eval
         mutable std::vector<Vec3> P_s_, V_s_, A_s_;
-        mutable std::vector<std::array<Vec3,6>> CP_s_;
+        mutable std::vector<std::array<Vec3, 6>> CP_s_;
         mutable std::vector<double> T_s_;
         mutable std::vector<Vec3> gP_s_, gV_s_, gA_s_;
         mutable std::vector<double> gT_s_;
 
         // in class SolverLBFGS (private:)
-        bool scale_derivs_ = true;  // default = current behavior (v̂ = T̄ V, â = T̄² A)
+        bool scale_derivs_ = true; // default = current behavior (v̂ = T̄ V, â = T̄² A)
 
         // -----------------------------------------------------------------------------
 
-        inline void reconstruct_inplace(const VecXd& z) const {
+        inline void reconstruct_inplace(const VecXd &z) const
+        {
             reconstruct(z, P_s_, V_s_, A_s_, CP_s_, T_s_);
         }
-
 
         inline bool useCorridorLayout() const { return corridor_q_active_; }
 

@@ -171,8 +171,8 @@ def main():
     ap.add_argument("--v_min", type=float, default=1.0)
     ap.add_argument("--v_max", type=float, default=5.0)
     ap.add_argument("--v_step", type=float, default=1.0)
-    ap.add_argument("--jerk_dec_min", type=int, default=-1)
-    ap.add_argument("--jerk_dec_max", type=int, default=0)
+    ap.add_argument("--jerk_dec_min", type=int, default=-3)
+    ap.add_argument("--jerk_dec_max", type=int, default=-2)
 
     # perimeter goals
     ap.add_argument("--x_min", type=float, default=-15.0)
@@ -180,7 +180,7 @@ def main():
     ap.add_argument("--y_min", type=float, default=-15.0)
     ap.add_argument("--y_max", type=float, default= 15.0)
     ap.add_argument("--z_goal", type=float, default=2.5)
-    ap.add_argument("--perim_step", type=float, default=2.5)
+    ap.add_argument("--perim_step", type=float, default=5.0)
     ap.add_argument("--start_corner", choices=["SW","SE","NE","NW"], default="SW")
     ap.add_argument("--clockwise", action="store_true", help="Traverse perimeter clockwise (default: CCW)")
 

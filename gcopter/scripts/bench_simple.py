@@ -68,7 +68,7 @@ def main():
 
     # fixed parameters (no sweeping)
     ap.add_argument("--max_vel", type=float, default=1.0, help="Fixed max velocity to pass to the benchmark")
-    ap.add_argument("--mighty_jerk_weight", type=str, default="1e0",
+    ap.add_argument("--mighty_jerk_weight", type=str, default="1e-3",
                     help="Fixed jerk weight to pass to the benchmark (string like 1e-3)")
 
     # start / goal
