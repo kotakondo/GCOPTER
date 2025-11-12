@@ -1,8 +1,14 @@
-# MIGHTY vs GCOPTER Benchmarking
+# MIGHTY Simple Demo
 
-This is a revised version for benchmarking based on Kumar Lab's repo (https://github.com/yuwei-wu/GCOPTER.git).
+| **Trajectory** |
+| ------------------------- |
+<a target="_blank" href="https://youtu.be/SI8YbMS-wyw"><img src="./imgs/mighty_gifs_complex_benchmarks.gif" width="350" height="193" alt="Complex Benchmarks"></a> |
+
+This is a revised version for benchmarking based on Kumar Lab's repo (https://github.com/yuwei-wu/GCOPTER.git), which implements the GCOPTER algorithm (See the "About GCOPTER" section below for more details). 
+
+## Paper
  
-## Usage 
+## Setup Instructions 
 
 ### Prerequisites
 
@@ -17,44 +23,22 @@ sudo apt install libpcl-dev libompl-dev
 ### Build
 
 ```bash
-mkdir -p gcopter_ws/src
-cd gcopter_ws/src
+mkdir -p ws/src
+cd ws/src
+git clone https://github.com/kotakondo/DecompROS2.git
 git clone https://github.com/kotakondo/GCOPTER.git
 cd ../
-colcon build --cmake-args -DCMAKE_INSTALL_PREFIX="$HOME/.local" -DCMAKE_C_COMPILER=/usr/bin/gcc -DCMAKE_CXX_COMPILER=/usr/bin/g++ ..
+colcon build --cmake-args -DCMAKE_BUILD_TYPE=Release
 source install/setup.bash
 ```
 
-### Advanced (FAST) Build Options
-
-First export the number of parallel workers (optional, default: number of CPU cores):
-```bash
-export J=$(nproc)  # number of parallel workers
-```
-
-Then build with the following command:
-```bash
-colcon build --merge-install --symlink-install   --parallel-workers $J   --cmake-args     -DCMAKE_BUILD_TYPE=Release     -DBUILD_TESTING=OFF     -DCMAKE_UNITY_BUILD=ON     -DCMAKE_C_COMPILER_LAUNCHER=ccache     -DCMAKE_CXX_COMPILER_LAUNCHER=ccache     -DCMAKE_C_FLAGS_RELEASE="-O3 -march=native -pipe -flto=thin -DNDEBUG"     -DCMAKE_CXX_FLAGS_RELEASE="-O3 -march=native -pipe -flto=thin -DEIGEN_NO_DEBUG -DNDEBUG"     -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -Wl,--threads=$J -Wl,--thinlto-jobs=$J"     -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld -Wl,--threads=$J -Wl,--thinlto-jobs=$J"
-```
-
-### Run Benchmark (simple case)
+### Run Simulation
 
 ```bash
-python3 src/GCOPTER/gcopter/scripts/bench_simple.py
+ros2 launch mighty mighty.launch.py
 ```
 
-### Run Benchmark (complex case)
-
-```bash
-python3 src/GCOPTER/gcopter/scripts/bench_sweep.py
-```
-
-### Useful Scripts
-
-- `analyze_data.ipynb`: Jupyter notebook for analyzing and visualizing the benchmark results.
-- `bench_simple.py`: Script for running a simple benchmark case.
-- `bench_sweep.py`: Script for running a sweep benchmark case.
-- `bag_id_shift.py`: Script for shifting the ID's in ROS bag files so that we can visualize multiple runs in one Rviz without marker ID conflicts.
+Now RViz should open automatically. You can click the "2D Nav Goal" button or type "g", then the cursor turns into a green arrow. Click somewhere in the RViz window to set the start position and then click the "2D Nav Goal" button (or type "g") again and click somewhere else to set the goal position. The planner will start running automatically after you set both the start and goal positions.
 
 ## About GCOPTER
 
@@ -74,7 +58,7 @@ __Paper__: [Geometrically Constrained Trajectory Optimization for Multicopters](
 }
 ```
 
-## Powerful Submodules
+## Submodules
 - [SDLP: Seidel's Algorithm](https://github.com/ZJU-FAST-Lab/SDLP) on Linear-Complexity Linear Programming for Computational Geometry.
 - [VertexEnumeration3D](https://github.com/ZJU-FAST-Lab/VertexEnumeration3D): Highly Efficient Vertex Enumeration for 3D Convex Polytopes (Outperforms [cddlib](https://github.com/cddlib/cddlib) in 3D).
 - [LBFGS-Lite](https://github.com/ZJU-FAST-Lab/LBFGS-Lite): An Easy-to-Use Header-Only L-BFGS Solver.
