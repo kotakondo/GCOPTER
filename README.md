@@ -1,8 +1,6 @@
 # MIGHTY Simple Demo
 
-| **Trajectory** |
-| ------------------------- |
-<a target="_blank" href="https://youtu.be/SI8YbMS-wyw"><img src="./imgs/mighty_gifs_complex_benchmarks.gif" width="350" height="193" alt="Complex Benchmarks"></a> |
+<a target="_blank" href="https://youtu.be/SI8YbMS-wyw"><img src="./imgs/mighty_click_example.gif" width="700" height="386" alt="Complex Benchmarks"></a>
 
 This is a revised version for benchmarking based on Kumar Lab's repo (https://github.com/yuwei-wu/GCOPTER.git), which implements the GCOPTER algorithm (See the "About GCOPTER" section below for more details). 
 
