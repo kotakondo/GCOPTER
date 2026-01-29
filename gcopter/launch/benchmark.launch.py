@@ -13,6 +13,14 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument("corridorMode", default_value="0"),
+        DeclareLaunchArgument("corridorCacheFile", default_value=""),
+        DeclareLaunchArgument("corridorBatchRoot", default_value=""),
+        DeclareLaunchArgument("corridorBatchOutRoot", default_value=""),
+        DeclareLaunchArgument("corridorBatchStart", default_value="0"),
+        DeclareLaunchArgument("corridorBatchCount", default_value="0"),
+        DeclareLaunchArgument("corridorBatchGoalWidth", default_value="3"),
+        DeclareLaunchArgument("corridorNoMap", default_value="false"),
         DeclareLaunchArgument('start', default_value='[0.0, 0.0, 0.5]'),
         DeclareLaunchArgument('goal',  default_value='[10.0, 3.0, 1.5]'),
         DeclareLaunchArgument('max_vel',  default_value='2.0'),
@@ -27,14 +35,23 @@ def generate_launch_description():
             name='minco_bench_viz',
             output='screen',
             parameters=[gcopter_config_path,
-                        {'Start': LaunchConfiguration('start'),
+                        {'corridorMode': LaunchConfiguration('corridorMode'),
+                         'corridorCacheFile': LaunchConfiguration('corridorCacheFile'),
+                         'corridorBatchRoot': LaunchConfiguration('corridorBatchRoot'),
+                         'corridorBatchOutRoot': LaunchConfiguration('corridorBatchOutRoot'),
+                         'corridorBatchStart': LaunchConfiguration('corridorBatchStart'),
+                         'corridorBatchCount': LaunchConfiguration('corridorBatchCount'),
+                         'corridorBatchGoalWidth': LaunchConfiguration('corridorBatchGoalWidth'),
+                         'corridorNoMap': LaunchConfiguration('corridorNoMap'),
+                         'Start': LaunchConfiguration('start'),
                          'Goal': LaunchConfiguration('goal'),
                          'MaxVelMag': LaunchConfiguration('max_vel'),
-                         'MightyJerkWeight': LaunchConfiguration('mighty_jerk_weight'),
+                         'MIGHTYJerkWeight': LaunchConfiguration('mighty_jerk_weight'),
                          'SampleDt': LaunchConfiguration('sample_dt'),
                          'CollisionDt': LaunchConfiguration('collision_dt'),
                          'ExportCSVDir': LaunchConfiguration('out_csv'),
                          'do_benchmark': True }],
+            arguments=['--ros-args', '--log-level', 'minco_bench_viz:=debug']
         ),
 
     ])

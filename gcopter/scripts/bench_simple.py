@@ -59,7 +59,7 @@ def main():
         description="Run the SAME start/goal multiple times (e.g., 100) and save outputs just like bench_sweep.py."
     )
     # output / run controls
-    ap.add_argument("--out_root", default="/media/kkondo/lucas_pro/mighty_gcopter_bench/simple_bench",
+    ap.add_argument("--out_root", default="/media/kkondo/T7/mighty_gcopter_bench/simple_bench",
                     help="Root directory for cases (same default as bench_sweep.py)")
     ap.add_argument("--n_runs", type=int, default=100, help="How many repeated runs to execute")
     ap.add_argument("--sleep_after_base", type=float, default=1.0, help="Seconds to wait after starting base.launch")

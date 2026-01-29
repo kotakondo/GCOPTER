@@ -378,7 +378,7 @@ void SolverLBFGS::checkGradCoordinates(const VecXd &z0, int max_coords, double e
         const double rel = abserr / std::max(1e-12, std::abs(g_fd) + std::abs(g_ad));
         worst = std::max(worst, rel);
 
-        if (rel > 1e-3)
+        if (rel > 1e-3 && g_fd > 1e-3 && g_ad > 1e-3)
             printf("\033[1;31m [idx %d] g_fd=%.6f g_ad=%.6f abs_err=%.6f rel_err=%.6f \033[0m\n",
                    i, g_fd, g_ad, abserr, rel);
     }

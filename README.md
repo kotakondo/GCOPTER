@@ -43,6 +43,17 @@ colcon build --merge-install --symlink-install   --parallel-workers $J   --cmake
 python3 src/GCOPTER/gcopter/scripts/bench_simple.py
 ```
 
+### Run Sweep Benchmark (simple case)
+
+First, cache the corridors:
+```bash
+python3 src/GCOPTER/gcopter/scripts/cache_corridors.py
+```
+Then run the sweep benchmark:
+```bash
+python3 src/GCOPTER/gcopter/scripts/bench_from_corridors.py --use_cpp_batch --n_runs 100 --goal_start 0
+```
+
 ### Run Benchmark (complex case)
 
 ```bash

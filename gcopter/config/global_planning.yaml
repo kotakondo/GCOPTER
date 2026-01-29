@@ -5,7 +5,7 @@
     DilateRadius:               0.5
     VoxelWidth:                 0.25
     MapBound:                   [-20.0, 20.0, -20.0, 20.0, 0.0, 5.0]
-    TimeoutRRT:                 3.0
+    TimeoutRRT:                 10.0
     MaxVelMag:                  2.0
     MaxBdrMag:                  2.1
     MaxTiltAngle:               1.05
@@ -51,7 +51,7 @@
     opt_timeout_ms:           -1.0   # no decimal point since this will be converted to int. Set to negative value for no timeout
 
     # L-BFGS parameters
-    lbfgs_mem_size:           256 #256
+    lbfgs_mem_size:           64 #256
     max_linesearch:           64 #40
     lbfgs_past:               3
     lbfgs_min_step:           1.0e-32

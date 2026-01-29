@@ -11,6 +11,7 @@
 #include "gcopter/flatness.hpp"
 #include "gcopter/voxel_map.hpp"
 #include "gcopter/sfc_gen.hpp"
+#include "gcopter/corridor_cache_io.hpp"
 #include <dynus/lbfgs_solver.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -21,6 +22,7 @@
 #include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <decomp_ros_msgs/msg/polyhedron_array.hpp>
@@ -39,6 +41,16 @@ using PolyhedraV = std::vector<PolyhedronV>;
 
 struct Config
 {
+
+    int corridorMode = 0;
+    std::string corridorCacheFile;
+    std::string corridorBatchRoot;
+    std::string corridorBatchOutRoot;
+    int corridorBatchStart = 0;
+    int corridorBatchCount = 0;
+    int corridorBatchGoalWidth = 3;
+    bool corridorNoMap = false;
+
     // Map + inputs
     std::string mapTopic;
     double dilateRadius;
@@ -81,7 +93,7 @@ struct Config
     double mightyOmegaWeight;  // w_omega for MIGHTY (LBFGS)
     double mightyThetaWeight;  // w_theta for MIGHTY (LBFGS)
     double mightyThrustWeight; // w_thrust for MIGHTY (LBFGS
-    double mightyINITITurnBF; // initial turn buffer in degrees
+    double mightyINITITurnBF;  // initial turn buffer in degrees
     double mightyJerkWeight;   // Jerk weight for MIGHTY (LBFGS
     double orientSmoothWeight; // w_orient_smooth
     double tiltBiasWeight;     // w_tilt_bias
@@ -116,12 +128,20 @@ struct Config
     Config(rclcpp::Node &node)
     {
         // Declare parameters with default values
+        node.declare_parameter("corridorMode", 0);
+        node.declare_parameter("corridorCacheFile", std::string(""));
+        node.declare_parameter("corridorBatchRoot", std::string(""));
+        node.declare_parameter("corridorBatchOutRoot", std::string(""));
+        node.declare_parameter("corridorBatchStart", 0);
+        node.declare_parameter("corridorBatchCount", 0);
+        node.declare_parameter("corridorBatchGoalWidth", 3);
+        node.declare_parameter("corridorNoMap", false);
         node.declare_parameter("MapTopic", std::string("/voxel_map"));
         node.declare_parameter("DilateRadius", 0.5);
         node.declare_parameter("VoxelWidth", 0.25);
         node.declare_parameter("MapBound", std::vector<double>{-25.0, 25.0, -25.0, 25.0, 0.0, 5.0});
-        node.declare_parameter("Start", std::vector<double>{0.0, 0.0, 0.5});
-        node.declare_parameter("Goal", std::vector<double>{10.0, 3.0, 1.5});
+        node.declare_parameter("Start", std::vector<double>{0.0, 1.0, 1.0});
+        node.declare_parameter("Goal", std::vector<double>{-7.0, -7.0, 1.0});
         node.declare_parameter("TimeoutRRT", 0.1);
         node.declare_parameter("MaxVelMag", 4.0);
         node.declare_parameter("MaxBdrMag", 2.1);
@@ -168,6 +188,14 @@ struct Config
         node.declare_parameter("do_benchmark", false); // if false, just visualize once
 
         // Get parameters from the node
+        node.get_parameter("corridorMode", corridorMode);
+        node.get_parameter("corridorCacheFile", corridorCacheFile);
+        node.get_parameter("corridorBatchRoot", corridorBatchRoot);
+        node.get_parameter("corridorBatchOutRoot", corridorBatchOutRoot);
+        node.get_parameter("corridorBatchStart", corridorBatchStart);
+        node.get_parameter("corridorBatchCount", corridorBatchCount);
+        node.get_parameter("corridorBatchGoalWidth", corridorBatchGoalWidth);
+        node.get_parameter("corridorNoMap", corridorNoMap);
         node.get_parameter("MapTopic", mapTopic);
         node.get_parameter("DilateRadius", dilateRadius);
         node.get_parameter("VoxelWidth", voxelWidth);
@@ -212,21 +240,13 @@ struct Config
         node.get_parameter("opt_timeout_ms", opt_timeout_ms);
         node.get_parameter("lbfgs_mem_size", lbfgs_mem_size);
         node.get_parameter("lbfgs_max_iterations", lbfgs_max_iterations);
+        std::cout << "L-BFGS max iterations: " << lbfgs_max_iterations << std::endl;
         node.get_parameter("lbfgs_past", lbfgs_past);
         node.get_parameter("lbfgs_min_step", lbfgs_min_step);
-        node.get_parameter("lbfgs_max_iterations", lbfgs_max_iterations);
         node.get_parameter("lbfgs_g_epsilon", lbfgs_g_epsilon);
         node.get_parameter("use_scaled_cost", use_scaled_cost);
         node.get_parameter("do_benchmark", do_benchmark);
 
-        // Print out the configuration
-        std::cout << "=== Config ===" << std::endl;
-        std::cout << "Start: [" << startXYZ[0] << ", " << startXYZ[1] << ", " << startXYZ[2] << "]" << std::endl;
-        std::cout << "Goal:  [" << goalXYZ[0] << ", " << goalXYZ[1] << ", " << goalXYZ[2] << "]" << std::endl;
-        std::cout << "MaxVelMag:  " << maxVelMag << std::endl;
-        std::cout << "MIGHTYJerkWeight:  " << mightyJerkWeight << std::endl;
-        std::cout << "SampleDt:  " << sampleDt << std::endl;
-        std::cout << "CollisionDt:  " << collisionDt << std::endl;
         if (exportCSVDir.size() > 0)
         {
 #if __cplusplus >= 201703L
@@ -718,7 +738,6 @@ class GlobalPlanner : public rclcpp::Node
 {
 
 private:
-
     Config config;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr mapSub;
     Visualizer visualizer;
@@ -736,6 +755,7 @@ private:
     std::vector<Eigen::MatrixX4d> hPolysCache_;
     rclcpp::TimerBase::SharedPtr repubTimer_;
     rclcpp::TimerBase::SharedPtr exit_timer_;
+    rclcpp::TimerBase::SharedPtr start_timer_;
     MightyOut M_mighty_;
 
     vec_E<Polyhedron<3>> poly_whole_;
@@ -750,8 +770,20 @@ private:
         return std::max(lo, std::min(x, hi));
     }
 
-public:
+    static std::string goalName(int idx, int width)
+    {
+        std::ostringstream oss;
+        oss << "goal_" << std::setw(width) << std::setfill('0') << idx;
+        return oss.str();
+    }
 
+    static bool fileExists(const std::string &path)
+    {
+        std::ifstream f(path);
+        return f.good();
+    }
+
+public:
     // Constructor
     GlobalPlanner() : Node("minco_bench_viz"), config(*this), visualizer(*this)
     {
@@ -764,9 +796,12 @@ public:
         voxelMapInfl_ = voxel_map::VoxelMap(xyz, offset, config.voxelWidth);
         voxelMapRaw_ = voxel_map::VoxelMap(xyz, offset, config.voxelWidth);
 
-        mapSub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-            config.mapTopic, rclcpp::SensorDataQoS(),
-            std::bind(&GlobalPlanner::mapCallBack, this, std::placeholders::_1));
+        if (!(config.corridorNoMap && (config.corridorMode == 2 || config.corridorMode == 3)))
+        {
+            mapSub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                config.mapTopic, rclcpp::SensorDataQoS(),
+                std::bind(&GlobalPlanner::mapCallBack, this, std::placeholders::_1));
+        }
 
         // Keep RViz markers alive
         if (!config.do_benchmark)
@@ -783,8 +818,22 @@ public:
 
         pub_poly_whole_ = this->create_publisher<decomp_ros_msgs::msg::PolyhedronArray>("poly_whole", 10);
 
-        RCLCPP_INFO(this->get_logger(), "minco_bench_viz ready. Waiting for map on %s",
-                    config.mapTopic.c_str());
+        if (config.corridorNoMap && (config.corridorMode == 2 || config.corridorMode == 3))
+        {
+            RCLCPP_INFO(this->get_logger(), "minco_bench_viz ready. Corridor-only mode (no map wait).");
+            start_timer_ = this->create_wall_timer(
+                std::chrono::milliseconds(1),
+                [this]()
+                {
+                    start_timer_->cancel();
+                    runCorridorNoMap_();
+                });
+        }
+        else
+        {
+            RCLCPP_INFO(this->get_logger(), "minco_bench_viz ready. Waiting for map on %s",
+                        config.mapTopic.c_str());
+        }
     }
 
     // Get do_benchmark flag
@@ -792,6 +841,7 @@ public:
 
     void mapCallBack(const sensor_msgs::msg::PointCloud2::SharedPtr msg)
     {
+
         // Ingest map once
         if (!mapInitialized)
         {
@@ -813,13 +863,91 @@ public:
             }
             voxelMapInfl_.dilate(std::ceil(config.dilateRadius / voxelMapInfl_.getScale()));
             mapInitialized = true;
-            RCLCPP_INFO(this->get_logger(), "Map ingested (%zu pts) & dilated.", total);
+            // RCLCPP_INFO(this->get_logger(), "Map ingested (%zu pts) & dilated.", total);
         }
 
         // Plan once after map ready using Start/Goal params
         if (mapInitialized && !plannedOnce)
         {
             plannedOnce = true;
+
+            if (config.corridorMode == 3)
+            {
+                if (config.corridorBatchRoot.empty())
+                {
+                    RCLCPP_ERROR(this->get_logger(), "corridorMode=3 but corridorBatchRoot is empty.");
+                    return;
+                }
+                if (config.corridorBatchCount <= 0)
+                {
+                    RCLCPP_ERROR(this->get_logger(), "corridorMode=3 but corridorBatchCount <= 0.");
+                    return;
+                }
+
+                const std::string out_root =
+                    config.corridorBatchOutRoot.empty() ? config.exportCSVDir : config.corridorBatchOutRoot;
+
+                for (int i = 0; i < config.corridorBatchCount; ++i)
+                {
+                    const int idx = config.corridorBatchStart + i;
+                    const std::string goal_dir = goalName(idx, config.corridorBatchGoalWidth);
+                    const std::string corridor_file =
+                        config.corridorBatchRoot + "/" + goal_dir + "/corridor_cache.bin";
+
+                    if (!fileExists(corridor_file))
+                    {
+                        RCLCPP_WARN(this->get_logger(), "Missing %s, stopping batch.", corridor_file.c_str());
+                        break;
+                    }
+
+                    auto cache = corridor_cache_io::loadCorridorBinarySeeded(corridor_file, 1e-6);
+
+                    startGoal.clear();
+                    startGoal.emplace_back(cache.start);
+                    startGoal.emplace_back(cache.goal);
+
+                    if (!out_root.empty())
+                    {
+                        config.exportCSVDir = out_root + "/" + goal_dir;
+                    }
+
+                    // visualize cached start/goal (not params)
+                    visualizer.visualizeStartGoal(cache.start, 0.5, 0);
+                    visualizer.visualizeStartGoal(cache.goal, 0.5, 1);
+                    visualizer.visualizePolytope(cache.hPolys);
+
+                    runPlannersFromCorridor(cache.route, cache.hPolys);
+                }
+
+                scheduleExitIfBenchmark_();
+                return;
+            }
+
+            if (config.corridorMode == 2)
+            {
+                if (config.corridorCacheFile.empty())
+                {
+                    RCLCPP_ERROR(this->get_logger(), "corridorMode=2 but corridorCacheFile is empty.");
+                    return;
+                }
+
+                auto cache = corridor_cache_io::loadCorridorBinarySeeded(config.corridorCacheFile, 1e-6);
+
+                startGoal.clear();
+                startGoal.emplace_back(cache.start);
+                startGoal.emplace_back(cache.goal);
+
+                // IMPORTANT: visualize the cached start/goal (not params)
+                visualizer.visualizeStartGoal(cache.start, 0.5, 0);
+                visualizer.visualizeStartGoal(cache.goal, 0.5, 1);
+                visualizer.visualizePolytope(cache.hPolys);
+
+                // run ONLY local planners using cache.hPolys + cache.start/goal
+                runPlannersFromCorridor(cache.route, cache.hPolys);
+
+                scheduleExitIfBenchmark_();
+                return; // <-- prevents the param-based start/goal path entirely
+            }
 
             auto S = config.startXYZ, G = config.goalXYZ;
             if (S.size() != 3 || G.size() != 3)
@@ -863,249 +991,84 @@ public:
         }
     }
 
-    void plan()
+    void runCorridorNoMap_()
     {
-        if (startGoal.size() != 2)
-            return;
-
-        // === 1) Global route (RRT), corridor from voxel surface
-        std::vector<Eigen::Vector3d> route;
-        sfc_gen::planPath<voxel_map::VoxelMap>(
-            startGoal[0], startGoal[1],
-            voxelMapInfl_.getOrigin(), voxelMapInfl_.getCorner(),
-            &voxelMapInfl_, config.timeoutRRT, route);
-
-        if (route.size() <= 1)
+        if (config.corridorMode == 3)
         {
-            RCLCPP_WARN(this->get_logger(), "Global route failed.");
-            return;
-        }
-
-        // === 2) SFC corridor
-        std::vector<Eigen::MatrixX4d> hPolys;
-        std::vector<Eigen::Vector3d> pc;
-        voxelMapInfl_.getSurf(pc);
-        sfc_gen::convexCover(route, pc, voxelMapInfl_.getOrigin(), voxelMapInfl_.getCorner(), config.sfc_progress, config.sfc_range, hPolys);
-        sfc_gen::shortCut(hPolys);
-        visualizer.visualizePolytope(hPolys);
-
-        // === 3) Boundary states (pos, vel=0, acc=0)
-        Eigen::Matrix3d iniState, finState;
-        iniState << route.front(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
-        finState << route.back(), Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
-
-        // === 4) GCOPTER
-        gcopter::GCOPTER_PolytopeSFC gcopter;
-        Eigen::VectorXd magnitudeBounds(5), penaltyWeights(5), physicalParams(6);
-        magnitudeBounds << config.maxVelMag, config.maxBdrMag, config.maxTiltAngle,
-            config.minThrust, config.maxThrust;
-        penaltyWeights << config.chiVec[0], config.chiVec[1], config.chiVec[2],
-            config.chiVec[3], config.chiVec[4];
-        physicalParams << config.vehicleMass, config.gravAcc, config.horizDrag,
-            config.vertDrag, config.parasDrag, config.speedEps;
-
-        traj.clear();
-        if (!gcopter.setup(config.weightT, iniState, finState, hPolys,
-                           INFINITY, config.smoothingEps, config.integralIntervs,
-                           magnitudeBounds, penaltyWeights, physicalParams))
-        {
-            RCLCPP_ERROR(this->get_logger(), "GCOPTER setup failed.");
-            return;
-        }
-
-        if (std::isinf(gcopter.optimize_with_timeout(traj, config.relCostTol, config.opt_timeout_ms, config.lbfgs_mem_size, config.lbfgs_max_linesearch, config.lbfgs_past, config.lbfgs_min_step, config.lbfgs_max_iterations, config.lbfgs_g_epsilon)))
-        {
-            RCLCPP_ERROR(this->get_logger(), "GCOPTER optimize failed.");
-            return;
-        }
-        double gc_ms = gcopter.getComputationTime();
-
-        if (traj.getPieceNum() > 0)
-        {
-            trajStamp = this->now().seconds();
-            visualizer.visualize(traj, route);
-            visualizer.visualizePolytope(hPolys);
-            routeCache_ = route;
-            hPolysCache_ = hPolys;
-        }
-
-        PolyhedraV vPolys;
-        gcopter.getVPolytopes(vPolys);
-
-        // === 5) Metrics for GCOPTER
-        double cc_inward_margin = 0.0;
-        double cc_tol = 1e-1;
-        Metrics M_gc = computeMetricsGCOPTER_sampled_dt(traj, config.sampleDt);
-        M_gc.solve_ms = gc_ms;
-        M_gc.n_collisions = countCollisionsGCOPTER(traj, hPolys, config.collisionDt, cc_inward_margin, cc_tol);
-        Eigen::Matrix3Xd init_points;
-        Eigen::VectorXd init_times, initial_xi;
-        gcopter.getInitialGuess(init_points, init_times, initial_xi);
-        int init_size = init_points.cols();
-
-        // === 6) Build MIGHTY params
-        planner_params_t mighty_cfg{};
-        mighty_cfg.verbose = true;
-        mighty_cfg.V_nom = config.maxVelMag;
-        mighty_cfg.V_max = config.maxVelMag;
-        mighty_cfg.A_max = 100.0;                                           // not used here
-        mighty_cfg.J_max = 0.0;                                           // not used here
-        mighty_cfg.time_weight = config.mightyWeightT;                    // you can tune this
-        mighty_cfg.dyn_weight = 0.0;                                      // no moving obstacles in this bench
-        mighty_cfg.stat_weight = config.mightyPosWeight;                  // w_stat_pos
-        mighty_cfg.jerk_weight = config.mightyJerkWeight;                 // you can tune this
-        mighty_cfg.dyn_constr_vel_weight = config.mightyVelWeight;        // w_dyn_constr_vel
-        mighty_cfg.dyn_constr_bodyrate_weight = config.mightyOmegaWeight; // w_dyn_constr_bodyrate
-        mighty_cfg.dyn_constr_tilt_weight = config.mightyThetaWeight;     // w_dyn_constr_tilt
-        mighty_cfg.dyn_constr_thrust_weight = config.mightyThrustWeight;  // w_dyn_constr_thrust
-        mighty_cfg.orient_smooth_weight = config.orientSmoothWeight;      // w_orient_smooth
-        mighty_cfg.tilt_bias_weight = config.tiltBiasWeight;              // w_tilt_bias
-        mighty_cfg.tvar_weight = config.tvarWeight;                       // w_tvar
-        mighty_cfg.Tmin_weight = config.TminWeight;                       // w_Tmin
-        mighty_cfg.Tmin_plan = config.TminPlan;                           // Tmin for planning
-        mighty_cfg.num_dyn_obst_samples = 64;
-        mighty_cfg.init_turn_bf = config.mightyINITITurnBF; // degrees
-        mighty_cfg.Co = 0.0;            // corridor “soft margin”
-        mighty_cfg.Cw = 0.40;           // dyn obstacle radius (unused here)
-        mighty_cfg.BIG = 1e9;
-        mighty_cfg.dc = 0.01; // sampling step for setpoints
-        mighty_cfg.second_to_last_vel_scale = 1.0;
-        mighty_cfg.integral_resolution = config.integralIntervs;
-        mighty_cfg.hinge_mu = config.smoothingEps;
-        mighty_cfg.omega_max = config.maxBdrMag;
-        mighty_cfg.tilt_max_rad = config.maxTiltAngle;
-        mighty_cfg.f_min = config.minThrust;
-        mighty_cfg.f_max = config.maxThrust;  // max thrust in N
-        mighty_cfg.mass = config.vehicleMass; // mass in kg
-        mighty_cfg.g = config.gravAcc;        // gravity in m/s^2
-
-        // === 7) Build MIGHTY boundary conditions
-        state init_state, goal_state;
-        init_state.pos = Vec3(route.front().x(), route.front().y(), route.front().z());
-        init_state.vel = Vec3::Zero();
-        init_state.accel = Vec3::Zero();
-        goal_state.pos = Vec3(route.back().x(), route.back().y(), route.back().z());
-        goal_state.vel = Vec3::Zero();
-        goal_state.accel = Vec3::Zero();
-
-        // === 8) Build MIGHTY initial guess (from GCOPTER)
-        vec_Vecf<3> route_m;
-        route_m.reserve(init_points.size() + 2); // +2 for start/goal
-        route_m.emplace_back(init_state.pos.x(), init_state.pos.y(), init_state.pos.z());
-        for (const auto &p : init_points.colwise())
-            route_m.emplace_back(p.x(), p.y(), p.z());
-        route_m.emplace_back(goal_state.pos.x(), goal_state.pos.y(), goal_state.pos.z());
-
-        // === 9) Convert GCOPTER’s hPolys to MIGHTY constraints
-        std::vector<LinearConstraint3D> l_constraints = toLinearConstraints(hPolys);
-        MightyOut M_mighty = runMighty(route_m, vPolys, initial_xi, init_times, l_constraints, init_state, goal_state, mighty_cfg, config, physicalParams);
-
-        // === 10) Draw MIGHTY trajectory in green, with its own namespace
-        visualizer.visualizeBezier(M_mighty.CP, M_mighty.T, /*ns=*/"mighty", /*width=*/0.3,
-                                   /*samples=*/120, /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
-                                   /*frame_id=*/"odom", config.maxVelMag);
-
-        // === 11) Cache cumulative edges for fast lookup
-        mightyEdges_.assign(M_mighty.T.size() + 1, 0.0);
-        for (size_t s = 0; s < M_mighty.T.size(); ++s)
-            mightyEdges_[s + 1] = mightyEdges_[s] + M_mighty.T[s];
-        mightyStamp_ = this->now().seconds();
-
-        // === 12) Build MIGHTY knot positions from Bezier CPs: P0 = CP[0][0], P_{s+1} = CP[s][5]
-        mightyKnots_.clear();
-        if (!M_mighty.CP.empty())
-        {
-            mightyKnots_.push_back(M_mighty.CP.front()[0]);
-            for (size_t s = 0; s < M_mighty.CP.size(); ++s)
-                mightyKnots_.push_back(M_mighty.CP[s][5]);
-        }
-
-        // === 13) Show knots as green spheres (persistent)
-        visualizer.visualizePoints(mightyKnots_,
-                                   /*radius=*/0.07f,
-                                   /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
-                                   /*frame=*/"odom",
-                                   /*ns=*/"mighty_knots",
-                                   /*ttl=*/0.0);
-
-        // === 14) Metrics for MIGHTY
-        Metrics M_m = computeMetricsMIGHTY_sampled_dt(M_mighty.CP, M_mighty.T, /*dt=*/config.sampleDt);
-        M_m.solve_ms = M_mighty.wall_ms;
-        M_m.n_collisions = countCollisionsMIGHTY(M_mighty.CP, M_mighty.T, hPolys, config.collisionDt, /* inward_margin */ cc_inward_margin, /* tol */ cc_tol);
-
-        // === 15) Print comparison & wall times
-        printCompare("GCOPTER", M_gc, "MIGHTY", M_m);
-        std::cout << "GCOPTER solve time [ms]: (printed by library or external timer)\n";
-        std::cout << "MIGHTY  solve time [ms]: " << M_mighty.wall_ms << "\n";
-        std::cout << "MIGHTY  final objective : " << M_mighty.obj << "\n";
-
-        if (!config.exportCSVDir.empty())
-        {
-            const std::string csv =
-                (config.exportCSVDir.back() == '/' ? config.exportCSVDir
-                                                   : config.exportCSVDir + "/") +
-                "bench_stats.csv";
-
-            // start and goal are already available in plan() as Eigen::Vector3d start, goal
-            appendStatsCSV(csv, config, startGoal.front(), startGoal.back(), M_gc, M_m);
-        }
-        M_mighty_ = M_mighty;
-
-        // === 16) Export VAJ histories to CSV (for Python plotting)
-        // Export GCOPTER and MIGHTY VAJ CSVs if requested
-        if (!config.exportCSVDir.empty())
-        {
-            const std::string dir = config.exportCSVDir;
-            const std::string f_gc = (dir.back() == '/' ? dir : dir + "/") + "gcopter_vaj.csv";
-            const std::string f_my = (dir.back() == '/' ? dir : dir + "/") + "mighty_vaj.csv";
-
-            writeCSV_GCOPTER(
-                traj, f_gc, config.sampleDt,
-                config.vehicleMass, config.gravAcc,
-                config.horizDrag, config.vertDrag, config.parasDrag,
-                config.speedEps);
-
-            writeCSV_MIGHTY(
-                M_mighty.CP, M_mighty.T, f_my, config.sampleDt,
-                config.vehicleMass, config.gravAcc,
-                config.horizDrag, config.vertDrag, config.parasDrag,
-                config.speedEps);
-        }
-    }
-
-    void republishMarkers_()
-    {
-        if (traj.getPieceNum() <= 0)
-            return;
-
-        if (!hPolysCache_.empty())
-            visualizer.visualizePolytope(hPolysCache_);
-        if (!routeCache_.empty())
-            visualizer.visualize(traj, routeCache_);
-        if (startGoal.size() == 2)
-        {
-            visualizer.visualizeStartGoal(startGoal[0], 0.5, 0);
-            visualizer.visualizeStartGoal(startGoal[1], 0.5, 1);
-        }
-
-        if (!mightyKnots_.empty())
-            visualizer.visualizePoints(mightyKnots_, 0.35f, 0.f, 1.f, 0.f, 1.f, "odom", "mighty_knots", 0.0);
-        if (!M_mighty_.CP.empty())
-            visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, "mighty", 0.3, 120, 0.f, 1.f, 0.f, 1.f, "odom", config.maxVelMag);
-    }
-
-    void scheduleExitIfBenchmark_()
-    {
-        if (!config.do_benchmark)
-            return;
-        // Small delay to let markers & CSV writes flush
-        exit_timer_ = this->create_wall_timer(
-            std::chrono::milliseconds(250),
-            [this]()
+            if (config.corridorBatchRoot.empty())
             {
-                RCLCPP_INFO(this->get_logger(), "[bench] one-shot mode: exiting node");
-                rclcpp::shutdown();
-            });
+                RCLCPP_ERROR(this->get_logger(), "corridorMode=3 but corridorBatchRoot is empty.");
+                return;
+            }
+            if (config.corridorBatchCount <= 0)
+            {
+                RCLCPP_ERROR(this->get_logger(), "corridorMode=3 but corridorBatchCount <= 0.");
+                return;
+            }
+
+            const std::string out_root =
+                config.corridorBatchOutRoot.empty() ? config.exportCSVDir : config.corridorBatchOutRoot;
+
+            for (int i = 0; i < config.corridorBatchCount; ++i)
+            {
+                const int idx = config.corridorBatchStart + i;
+                const std::string goal_dir = goalName(idx, config.corridorBatchGoalWidth);
+                const std::string corridor_file =
+                    config.corridorBatchRoot + "/" + goal_dir + "/corridor_cache.bin";
+
+                if (!fileExists(corridor_file))
+                {
+                    RCLCPP_WARN(this->get_logger(), "Missing %s, stopping batch.", corridor_file.c_str());
+                    break;
+                }
+
+                auto cache = corridor_cache_io::loadCorridorBinarySeeded(corridor_file, 1e-6);
+
+                startGoal.clear();
+                startGoal.emplace_back(cache.start);
+                startGoal.emplace_back(cache.goal);
+
+                if (!out_root.empty())
+                {
+                    config.exportCSVDir = out_root + "/" + goal_dir;
+                }
+
+                visualizer.visualizeStartGoal(cache.start, 0.5, 0);
+                visualizer.visualizeStartGoal(cache.goal, 0.5, 1);
+                visualizer.visualizePolytope(cache.hPolys);
+
+                runPlannersFromCorridor(cache.route, cache.hPolys);
+            }
+
+            scheduleExitIfBenchmark_();
+            return;
+        }
+
+        if (config.corridorMode == 2)
+        {
+            if (config.corridorCacheFile.empty())
+            {
+                RCLCPP_ERROR(this->get_logger(), "corridorMode=2 but corridorCacheFile is empty.");
+                return;
+            }
+
+            auto cache = corridor_cache_io::loadCorridorBinarySeeded(config.corridorCacheFile, 1e-6);
+
+            startGoal.clear();
+            startGoal.emplace_back(cache.start);
+            startGoal.emplace_back(cache.goal);
+
+            visualizer.visualizeStartGoal(cache.start, 0.5, 0);
+            visualizer.visualizeStartGoal(cache.goal, 0.5, 1);
+            visualizer.visualizePolytope(cache.hPolys);
+
+            runPlannersFromCorridor(cache.route, cache.hPolys);
+
+            scheduleExitIfBenchmark_();
+            return;
+        }
+
+        RCLCPP_WARN(this->get_logger(), "runCorridorNoMap_ called in non-corridor mode.");
     }
 
     void process()
@@ -1220,6 +1183,347 @@ public:
         visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, /*ns=*/"mighty", /*width=*/0.3,
                                    /*samples=*/120, /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
                                    /*frame_id=*/"odom", config.maxVelMag);
+    }
+
+private:
+    // Run ONLY local trajectory planners (GCOPTER + MIGHTY) given a precomputed corridor.
+    // Inputs are typically loaded from your cached corridor file:
+    //   - route: polyline points (for visualization + start/goal)
+    //   - hPolys: SFC corridor in H-form, one polytope per segment
+    void runPlannersFromCorridor(const std::vector<Eigen::Vector3d> &route,
+                                 const std::vector<Eigen::MatrixX4d> &hPolys)
+    {
+        if (route.size() < 2)
+        {
+            RCLCPP_ERROR(this->get_logger(), "runPlannersFromCorridor: route.size() < 2");
+            return;
+        }
+        if (hPolys.empty())
+        {
+            RCLCPP_ERROR(this->get_logger(), "runPlannersFromCorridor: empty hPolys");
+            return;
+        }
+
+        const Eigen::Vector3d start = route.front();
+        const Eigen::Vector3d goal = route.back();
+
+        // === 3) Boundary states (pos, vel=0, acc=0)
+        Eigen::Matrix3d iniState, finState;
+        iniState << start, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
+        finState << goal, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
+
+        // === 4) GCOPTER
+        gcopter::GCOPTER_PolytopeSFC gcopter;
+        Eigen::VectorXd magnitudeBounds(5), penaltyWeights(5), physicalParams(6);
+        magnitudeBounds << config.maxVelMag, config.maxBdrMag, config.maxTiltAngle,
+            config.minThrust, config.maxThrust;
+        penaltyWeights << config.chiVec[0], config.chiVec[1], config.chiVec[2],
+            config.chiVec[3], config.chiVec[4];
+        physicalParams << config.vehicleMass, config.gravAcc, config.horizDrag,
+            config.vertDrag, config.parasDrag, config.speedEps;
+
+        traj.clear();
+        if (!gcopter.setup(config.weightT, iniState, finState, hPolys,
+                           INFINITY, config.smoothingEps, config.integralIntervs,
+                           magnitudeBounds, penaltyWeights, physicalParams))
+        {
+            RCLCPP_ERROR(this->get_logger(), "GCOPTER setup failed.");
+            return;
+        }
+
+        if (std::isinf(gcopter.optimize_with_timeout(traj,
+                                                     config.relCostTol,
+                                                     config.opt_timeout_ms,
+                                                     config.lbfgs_mem_size,
+                                                     config.lbfgs_max_linesearch,
+                                                     config.lbfgs_past,
+                                                     config.lbfgs_min_step,
+                                                     config.lbfgs_max_iterations,
+                                                     config.lbfgs_g_epsilon)))
+        {
+            RCLCPP_ERROR(this->get_logger(), "GCOPTER optimize failed.");
+            return;
+        }
+        double gc_ms = gcopter.getComputationTime();
+
+        // Visualization + cache (same behavior as plan())
+        if (traj.getPieceNum() > 0)
+        {
+            trajStamp = this->now().seconds();
+            visualizer.visualize(traj, route);
+            visualizer.visualizePolytope(hPolys);
+            routeCache_ = route;
+            hPolysCache_ = hPolys;
+        }
+
+        PolyhedraV vPolys;
+        gcopter.getVPolytopes(vPolys);
+
+        // === 5) Metrics for GCOPTER
+        double cc_inward_margin = 0.0;
+        double cc_tol = 1e-1;
+        Metrics M_gc = computeMetricsGCOPTER_sampled_dt(traj, config.sampleDt);
+        M_gc.solve_ms = gc_ms;
+        M_gc.n_collisions = countCollisionsGCOPTER(traj, hPolys, config.collisionDt, cc_inward_margin, cc_tol);
+
+        // Initial guess extraction for MIGHTY
+        Eigen::Matrix3Xd init_points;
+        Eigen::VectorXd init_times, initial_xi;
+        gcopter.getInitialGuess(init_points, init_times, initial_xi);
+        (void)init_points;
+        (void)init_times;
+        (void)initial_xi;
+
+        // === 6) Build MIGHTY params
+        planner_params_t mighty_cfg{};
+        mighty_cfg.verbose = true;
+        mighty_cfg.V_nom = config.maxVelMag;
+        mighty_cfg.V_max = config.maxVelMag;
+        mighty_cfg.A_max = 100.0; // not used here
+        mighty_cfg.J_max = 0.0;   // not used here
+        mighty_cfg.time_weight = config.mightyWeightT;
+        mighty_cfg.dyn_weight = 0.0;
+        mighty_cfg.stat_weight = config.mightyPosWeight;
+        mighty_cfg.jerk_weight = config.mightyJerkWeight;
+        mighty_cfg.dyn_constr_vel_weight = config.mightyVelWeight;
+        mighty_cfg.dyn_constr_bodyrate_weight = config.mightyOmegaWeight;
+        mighty_cfg.dyn_constr_tilt_weight = config.mightyThetaWeight;
+        mighty_cfg.dyn_constr_thrust_weight = config.mightyThrustWeight;
+        mighty_cfg.orient_smooth_weight = config.orientSmoothWeight;
+        mighty_cfg.tilt_bias_weight = config.tiltBiasWeight;
+        mighty_cfg.tvar_weight = config.tvarWeight;
+        mighty_cfg.Tmin_weight = config.TminWeight;
+        mighty_cfg.Tmin_plan = config.TminPlan;
+        mighty_cfg.num_dyn_obst_samples = 64;
+        mighty_cfg.init_turn_bf = config.mightyINITITurnBF; // degrees
+        mighty_cfg.Co = 0.0;
+        mighty_cfg.Cw = 0.40;
+        mighty_cfg.BIG = 1e9;
+        mighty_cfg.dc = 0.01;
+        mighty_cfg.second_to_last_vel_scale = 1.0;
+        mighty_cfg.integral_resolution = config.integralIntervs;
+        mighty_cfg.hinge_mu = config.smoothingEps;
+        mighty_cfg.omega_max = config.maxBdrMag;
+        mighty_cfg.tilt_max_rad = config.maxTiltAngle;
+        mighty_cfg.f_min = config.minThrust;
+        mighty_cfg.f_max = config.maxThrust;
+        mighty_cfg.mass = config.vehicleMass;
+        mighty_cfg.g = config.gravAcc;
+
+        // === 7) Build MIGHTY boundary conditions
+        state init_state, goal_state;
+        init_state.pos = Vec3(start.x(), start.y(), start.z());
+        init_state.vel = Vec3::Zero();
+        init_state.accel = Vec3::Zero();
+        goal_state.pos = Vec3(goal.x(), goal.y(), goal.z());
+        goal_state.vel = Vec3::Zero();
+        goal_state.accel = Vec3::Zero();
+
+        // === 8) Build MIGHTY initial guess (from GCOPTER)
+        vec_Vecf<3> route_m;
+        route_m.reserve(init_points.cols() + 2);
+        route_m.emplace_back(init_state.pos.x(), init_state.pos.y(), init_state.pos.z());
+        for (const auto &p : init_points.colwise())
+            route_m.emplace_back(p.x(), p.y(), p.z());
+        route_m.emplace_back(goal_state.pos.x(), goal_state.pos.y(), goal_state.pos.z());
+
+        // === 9) Convert hPolys to MIGHTY constraints + Run MIGHTY
+        std::vector<LinearConstraint3D> l_constraints = toLinearConstraints(hPolys);
+        MightyOut M_mighty = runMighty(route_m, vPolys, initial_xi, init_times, l_constraints,
+                                       init_state, goal_state, mighty_cfg, config, physicalParams);
+
+        // === 10) Draw MIGHTY trajectory in green
+        visualizer.visualizeBezier(M_mighty.CP, M_mighty.T, /*ns=*/"mighty", /*width=*/0.3,
+                                   /*samples=*/120, /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
+                                   /*frame_id=*/"odom", config.maxVelMag);
+
+        // === 11) Cache cumulative edges for fast lookup
+        mightyEdges_.assign(M_mighty.T.size() + 1, 0.0);
+        for (size_t s = 0; s < M_mighty.T.size(); ++s)
+            mightyEdges_[s + 1] = mightyEdges_[s] + M_mighty.T[s];
+        mightyStamp_ = this->now().seconds();
+
+        // === 12) Build MIGHTY knot positions from Bezier CPs
+        mightyKnots_.clear();
+        if (!M_mighty.CP.empty())
+        {
+            mightyKnots_.push_back(M_mighty.CP.front()[0]);
+            for (size_t s = 0; s < M_mighty.CP.size(); ++s)
+                mightyKnots_.push_back(M_mighty.CP[s][5]);
+        }
+
+        // === 13) Show knots as green spheres
+        visualizer.visualizePoints(mightyKnots_,
+                                   /*radius=*/0.07f,
+                                   /*r=*/0.0f, /*g=*/1.0f, /*b=*/0.0f, /*a=*/1.0f,
+                                   /*frame=*/"odom",
+                                   /*ns=*/"mighty_knots",
+                                   /*ttl=*/0.0);
+
+        // === 14) Metrics for MIGHTY
+        Metrics M_m = computeMetricsMIGHTY_sampled_dt(M_mighty.CP, M_mighty.T, /*dt=*/config.sampleDt);
+        M_m.solve_ms = M_mighty.wall_ms;
+        M_m.n_collisions = countCollisionsMIGHTY(M_mighty.CP, M_mighty.T, hPolys,
+                                                 config.collisionDt, cc_inward_margin, cc_tol);
+
+        // === 15) Print comparison
+        printCompare("GCOPTER", M_gc, "MIGHTY", M_m);
+        std::cout << "MIGHTY  solve time [ms]: " << M_mighty.wall_ms << "\n";
+        std::cout << "MIGHTY  final objective : " << M_mighty.obj << "\n";
+
+        // === 16) Export stats CSV (optional)
+        if (!config.exportCSVDir.empty())
+        {
+            const std::string csv =
+                (config.exportCSVDir.back() == '/' ? config.exportCSVDir
+                                                   : config.exportCSVDir + "/") +
+                "bench_stats.csv";
+            appendStatsCSV(csv, config, start, goal, M_gc, M_m);
+        }
+
+        M_mighty_ = M_mighty;
+
+        // Export VAJ histories if you already do that below in plan()
+        if (!config.exportCSVDir.empty())
+        {
+            const std::string dir = config.exportCSVDir;
+            const std::string f_gc = (dir.back() == '/' ? dir : dir + "/") + "gcopter_vaj.csv";
+            const std::string f_my = (dir.back() == '/' ? dir : dir + "/") + "mighty_vaj.csv";
+
+            writeCSV_GCOPTER(traj, f_gc, config.sampleDt,
+                             config.vehicleMass, config.gravAcc,
+                             config.horizDrag, config.vertDrag, config.parasDrag,
+                             config.speedEps);
+
+            writeCSV_MIGHTY(M_mighty.CP, M_mighty.T, f_my, config.sampleDt,
+                            config.vehicleMass, config.gravAcc,
+                            config.horizDrag, config.vertDrag, config.parasDrag,
+                            config.speedEps);
+        }
+    }
+
+    void plan()
+    {
+        // Local containers
+        std::vector<Eigen::Vector3d> route;
+        std::vector<Eigen::MatrixX4d> hPolys;
+
+        // -------------------------------------------------------------------------
+        // MODE 0/1: compute global route + corridor from current startGoal
+        // -------------------------------------------------------------------------
+        if (startGoal.size() != 2)
+        {
+            RCLCPP_ERROR(this->get_logger(), "plan(): startGoal must have 2 points [start, goal].");
+            return;
+        }
+
+        // 1) Global route
+        sfc_gen::planPath<voxel_map::VoxelMap>(
+            startGoal[0], startGoal[1],
+            voxelMapInfl_.getOrigin(), voxelMapInfl_.getCorner(),
+            &voxelMapInfl_, config.timeoutRRT, route);
+
+        if (route.size() <= 1)
+        {
+            RCLCPP_WARN(this->get_logger(), "Global route failed.");
+            return;
+        }
+
+        // 2) SFC corridor
+        std::vector<Eigen::Vector3d> pc;
+        voxelMapInfl_.getSurf(pc);
+
+        sfc_gen::convexCover(route, pc,
+                             voxelMapInfl_.getOrigin(), voxelMapInfl_.getCorner(),
+                             config.sfc_progress, config.sfc_range, hPolys);
+
+        sfc_gen::shortCut(hPolys);
+
+        if (hPolys.empty())
+        {
+            RCLCPP_WARN(this->get_logger(), "convexCover/shortCut produced empty corridor.");
+            return;
+        }
+
+        // Visualize corridor
+        visualizer.visualizePolytope(hPolys);
+
+        // Cache for republishMarkers_
+        routeCache_ = route;
+        hPolysCache_ = hPolys;
+
+        // -------------------------------------------------------------------------
+        // MODE 1: save corridor cache and exit early (no local planners)
+        // -------------------------------------------------------------------------
+        if (config.corridorMode == 1)
+        {
+            if (config.corridorCacheFile.empty())
+            {
+                RCLCPP_ERROR(this->get_logger(), "corridorMode=1 but corridorCacheFile is empty.");
+                return;
+            }
+
+            try
+            {
+                corridor_cache_io::saveCorridorBinary(
+                    config.corridorCacheFile,
+                    route.front(),
+                    route.back(),
+                    route,
+                    hPolys);
+            }
+            catch (const std::exception &e)
+            {
+                RCLCPP_ERROR(this->get_logger(), "Failed to save corridor cache '%s': %s",
+                             config.corridorCacheFile.c_str(), e.what());
+                return;
+            }
+
+            RCLCPP_INFO(this->get_logger(), "Saved corridor cache: %s", config.corridorCacheFile.c_str());
+
+            scheduleExitIfBenchmark_();
+            return; // IMPORTANT: do not run local planners
+        }
+
+        // -------------------------------------------------------------------------
+        // MODE 0: run local planners on computed corridor
+        // -------------------------------------------------------------------------
+        runPlannersFromCorridor(route, hPolys);
+    }
+
+    void republishMarkers_()
+    {
+        if (traj.getPieceNum() <= 0)
+            return;
+
+        if (!hPolysCache_.empty())
+            visualizer.visualizePolytope(hPolysCache_);
+        if (!routeCache_.empty())
+            visualizer.visualize(traj, routeCache_);
+        if (startGoal.size() == 2)
+        {
+            visualizer.visualizeStartGoal(startGoal[0], 0.5, 0);
+            visualizer.visualizeStartGoal(startGoal[1], 0.5, 1);
+        }
+
+        if (!mightyKnots_.empty())
+            visualizer.visualizePoints(mightyKnots_, 0.35f, 0.f, 1.f, 0.f, 1.f, "odom", "mighty_knots", 0.0);
+        if (!M_mighty_.CP.empty())
+            visualizer.visualizeBezier(M_mighty_.CP, M_mighty_.T, "mighty", 0.3, 120, 0.f, 1.f, 0.f, 1.f, "odom", config.maxVelMag);
+    }
+
+    void scheduleExitIfBenchmark_()
+    {
+        if (!config.do_benchmark)
+            return;
+        // Small delay to let markers & CSV writes flush
+        exit_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(250),
+            [this]()
+            {
+                RCLCPP_INFO(this->get_logger(), "[bench] one-shot mode: exiting node");
+                rclcpp::shutdown();
+            });
     }
 
     // GCOPTER: sample [0, T_tot] every dt and write CSV (now with ω, tilt, thrust)
