@@ -39,6 +39,27 @@
     TvarWeight:                 0.0
     TminWeight:                 0.0
     TminPlan:                   0.0
+    VelRefEnable:               false
+    VelRefKnot:                 -1
+    VelRef:                     [0.0, 0.0, 0.0]
+    VelRefWeight:               0.0
+    MIGHTYFreezeEnable:         false
+    VelRefGradCheck:            false
+    VelRefLogEvery:             0
+    PosRefEnable:               false
+    PosRefKnot:                 -1
+    PosRef:                     [0.0, 0.0, 0.0]
+    PosRefWeight:               0.0
+    PosRefGradCheck:            false
+    PosRefLogEvery:             0
+    MIGHTYFullGradCheckEnable:  false
+    MIGHTYFullGradCheckDirs:    8
+    MIGHTYFullGradCheckMaxCoords: 256
+    MIGHTYFullGradCheckEps:     1.0e-5
+    GCOPTERFullGradCheckEnable: false
+    GCOPTERFullGradCheckDirs:   8
+    GCOPTERFullGradCheckMaxCoords: 256
+    GCOPTERFullGradCheckEps:    1.0e-5
 
     # Collision checking parameters
     CollisionDt:                0.01

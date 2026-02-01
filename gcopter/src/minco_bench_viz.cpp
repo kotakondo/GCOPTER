@@ -101,6 +101,30 @@ struct Config
     double TminWeight;         // w_Tmin
     double TminPlan;           // Tmin for planning
 
+    // Velocity reference (shared GCOPTER + MIGHTY)
+    bool velRefEnable;
+    int velRefKnot;
+    Eigen::Vector3d velRef;
+    double velRefWeight;
+    bool mightyFreezeEnable;
+    bool velRefGradCheck;
+    int velRefLogEvery;
+    // Position reference (shared GCOPTER + MIGHTY)
+    bool posRefEnable;
+    int posRefKnot;
+    Eigen::Vector3d posRef;
+    double posRefWeight;
+    bool posRefGradCheck;
+    int posRefLogEvery;
+    bool mightyFullGradCheckEnable;
+    int mightyFullGradCheckDirs;
+    int mightyFullGradCheckMaxCoords;
+    double mightyFullGradCheckEps;
+    bool gcopterFullGradCheckEnable;
+    int gcopterFullGradCheckDirs;
+    int gcopterFullGradCheckMaxCoords;
+    double gcopterFullGradCheckEps;
+
     // Collision checking
     double collisionDt; // sampling step for collision checking
 
@@ -174,6 +198,27 @@ struct Config
         node.declare_parameter("MIGHTYThrustWeight", 1.0e+5);    // w_thrust for MIGHTY (LBFGS)
         node.declare_parameter("MIGHTYINITI_TURNBF", 15.0);      // initial turn buffer in degrees
         node.declare_parameter("MIGHTYJerkWeight", 0.1);         // Jerk weight for MIGHTY (LBFGS)
+        node.declare_parameter("VelRefEnable", false);
+        node.declare_parameter("VelRefKnot", -1);
+        node.declare_parameter("VelRef", std::vector<double>{0.0, 0.0, 0.0});
+        node.declare_parameter("VelRefWeight", 0.0);
+        node.declare_parameter("MIGHTYFreezeEnable", false);
+        node.declare_parameter("VelRefGradCheck", false);
+        node.declare_parameter("VelRefLogEvery", 0);
+        node.declare_parameter("PosRefEnable", false);
+        node.declare_parameter("PosRefKnot", -1);
+        node.declare_parameter("PosRef", std::vector<double>{0.0, 0.0, 0.0});
+        node.declare_parameter("PosRefWeight", 0.0);
+        node.declare_parameter("PosRefGradCheck", false);
+        node.declare_parameter("PosRefLogEvery", 0);
+        node.declare_parameter("MIGHTYFullGradCheckEnable", false);
+        node.declare_parameter("MIGHTYFullGradCheckDirs", 8);
+        node.declare_parameter("MIGHTYFullGradCheckMaxCoords", 256);
+        node.declare_parameter("MIGHTYFullGradCheckEps", 1.0e-5);
+        node.declare_parameter("GCOPTERFullGradCheckEnable", false);
+        node.declare_parameter("GCOPTERFullGradCheckDirs", 8);
+        node.declare_parameter("GCOPTERFullGradCheckMaxCoords", 256);
+        node.declare_parameter("GCOPTERFullGradCheckEps", 1.0e-5);
         node.declare_parameter("CollisionDt", 0.01);
         node.declare_parameter("sfc_progress", 0.5);   // progress along the route for corridor generation
         node.declare_parameter("sfc_range", 3.0);      // range around
@@ -234,6 +279,37 @@ struct Config
         node.get_parameter("MIGHTYThrustWeight", mightyThrustWeight);
         node.get_parameter("MIGHTYINITI_TURNBF", mightyINITITurnBF);
         node.get_parameter("MIGHTYJerkWeight", mightyJerkWeight);
+        node.get_parameter("VelRefEnable", velRefEnable);
+        node.get_parameter("VelRefKnot", velRefKnot);
+        std::vector<double> vel_ref_vec;
+        node.get_parameter("VelRef", vel_ref_vec);
+        node.get_parameter("VelRefWeight", velRefWeight);
+        node.get_parameter("MIGHTYFreezeEnable", mightyFreezeEnable);
+        node.get_parameter("VelRefGradCheck", velRefGradCheck);
+        node.get_parameter("VelRefLogEvery", velRefLogEvery);
+        node.get_parameter("PosRefEnable", posRefEnable);
+        node.get_parameter("PosRefKnot", posRefKnot);
+        std::vector<double> pos_ref_vec;
+        node.get_parameter("PosRef", pos_ref_vec);
+        node.get_parameter("PosRefWeight", posRefWeight);
+        node.get_parameter("PosRefGradCheck", posRefGradCheck);
+        node.get_parameter("PosRefLogEvery", posRefLogEvery);
+        node.get_parameter("MIGHTYFullGradCheckEnable", mightyFullGradCheckEnable);
+        node.get_parameter("MIGHTYFullGradCheckDirs", mightyFullGradCheckDirs);
+        node.get_parameter("MIGHTYFullGradCheckMaxCoords", mightyFullGradCheckMaxCoords);
+        node.get_parameter("MIGHTYFullGradCheckEps", mightyFullGradCheckEps);
+        node.get_parameter("GCOPTERFullGradCheckEnable", gcopterFullGradCheckEnable);
+        node.get_parameter("GCOPTERFullGradCheckDirs", gcopterFullGradCheckDirs);
+        node.get_parameter("GCOPTERFullGradCheckMaxCoords", gcopterFullGradCheckMaxCoords);
+        node.get_parameter("GCOPTERFullGradCheckEps", gcopterFullGradCheckEps);
+        if (vel_ref_vec.size() == 3)
+            velRef = Eigen::Vector3d(vel_ref_vec[0], vel_ref_vec[1], vel_ref_vec[2]);
+        else
+            velRef = Eigen::Vector3d::Zero();
+        if (pos_ref_vec.size() == 3)
+            posRef = Eigen::Vector3d(pos_ref_vec[0], pos_ref_vec[1], pos_ref_vec[2]);
+        else
+            posRef = Eigen::Vector3d::Zero();
         node.get_parameter("CollisionDt", collisionDt);
         node.get_parameter("sfc_progress", sfc_progress);
         node.get_parameter("sfc_range", sfc_range);
@@ -273,6 +349,17 @@ struct Metrics
     double jerk_cost{0.0}; // ∫||j|| dt  (same definition as your sampling metrics)
     double solve_ms{0.0};  // planner's wall time in milliseconds
     int n_collisions{0};   // # sampled positions that hit occupied voxels
+    // Reference tracking errors (if enabled)
+    double pref_err{-1.0}; // position reference error (L2 norm), -1 if not enabled
+    double vref_err{-1.0}; // velocity reference error (L2 norm), -1 if not enabled
+    // Reference values used
+    Eigen::Vector3d pos_ref{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d vel_ref{Eigen::Vector3d::Zero()};
+    // Actual values at reference knot
+    Eigen::Vector3d pos_actual{Eigen::Vector3d::Zero()};
+    Eigen::Vector3d vel_actual{Eigen::Vector3d::Zero()};
+    int pref_knot{-1};
+    int vref_knot{-1};
 };
 
 // Evaluate a 5th-degree Bezier curve.
@@ -642,6 +729,9 @@ struct MightyOut
 {
     std::vector<std::array<Eigen::Vector3d, 6>> CP;
     std::vector<double> T;
+    std::vector<Eigen::Vector3d> P;
+    std::vector<Eigen::Vector3d> V;
+    std::vector<Eigen::Vector3d> A;
     double obj{0.0};
     double wall_ms{0.0};
 };
@@ -728,6 +818,50 @@ static MightyOut runMighty(
                 out.CP[s][j] = Eigen::Vector3d(CPv[s][j].x(), CPv[s][j].y(), CPv[s][j].z());
         }
         out.T = Tv;
+        out.P.resize(P.size());
+        out.V.resize(V.size());
+        out.A.resize(A.size());
+        for (size_t i = 0; i < P.size(); ++i)
+        {
+            out.P[i] = Eigen::Vector3d(P[i].x(), P[i].y(), P[i].z());
+            out.V[i] = Eigen::Vector3d(V[i].x(), V[i].y(), V[i].z());
+            out.A[i] = Eigen::Vector3d(A[i].x(), A[i].y(), A[i].z());
+        }
+
+        if (params.vel_ref_enable && params.vel_ref_knot > 0 && params.vel_ref_knot < (int)V.size())
+        {
+            const Vec3 v_i = V[params.vel_ref_knot];
+            const Vec3 vref(params.vel_ref.x(), params.vel_ref.y(), params.vel_ref.z());
+            const Vec3 e = v_i - vref;
+            const double J_vref = 0.5 * params.vel_ref_weight * e.squaredNorm();
+            std::cout << "[MIGHTY][final] vref_knot=" << params.vel_ref_knot
+                      << " v_i=" << v_i.transpose()
+                      << " |e|=" << e.norm()
+                      << " J_vref=" << J_vref
+                      << " freeze=" << (params.mighty_freeze_enable ? "true" : "false")
+                      << "\n";
+
+        }
+
+        if (params.pos_ref_enable && params.pos_ref_knot > 0 && params.pos_ref_knot < (int)P.size())
+        {
+            const Vec3 p_i = P[params.pos_ref_knot];
+            const Vec3 pref(params.pos_ref.x(), params.pos_ref.y(), params.pos_ref.z());
+            const Vec3 e = p_i - pref;
+            const double J_pref = 0.5 * params.pos_ref_weight * e.squaredNorm();
+            std::cout << "[MIGHTY][final] pref_knot=" << params.pos_ref_knot
+                      << " p_i=" << p_i.transpose()
+                      << " |e|=" << e.norm()
+                      << " J_pref=" << J_pref
+                      << "\n";
+        }
+
+        if (params.vel_ref_enable || params.pos_ref_enable)
+        {
+            Eigen::VectorXd gtmp(zopt.size());
+            solver->evaluateObjectiveAndGradientFused(zopt, gtmp);
+            solver->printObjectiveBreakdown("MIGHTY");
+        }
     }
 
     return out;
@@ -1207,6 +1341,54 @@ private:
         const Eigen::Vector3d start = route.front();
         const Eigen::Vector3d goal = route.back();
 
+        // Auto-select ref knot if requested (use penultimate point by default).
+        bool vel_ref_enable_eff = config.velRefEnable;
+        int vel_ref_knot_eff = config.velRefKnot;
+        bool pos_ref_enable_eff = config.posRefEnable;
+        int pos_ref_knot_eff = config.posRefKnot;
+
+        int auto_knot = -1;
+        if (route.size() >= 3 && hPolys.size() >= 2)
+        {
+            const int route_knot = static_cast<int>(route.size()) - 2;
+            const int poly_knot = static_cast<int>(hPolys.size()) - 1;
+            auto_knot = std::max(1, std::min(route_knot, poly_knot));
+        }
+
+        if (vel_ref_enable_eff && vel_ref_knot_eff <= 0)
+        {
+            if (auto_knot > 0)
+            {
+                vel_ref_knot_eff = auto_knot;
+                std::cout << "[vref] auto vel_ref_knot=" << vel_ref_knot_eff
+                          << " (route_pts=" << route.size()
+                          << " polys=" << hPolys.size() << ")\n";
+            }
+            else
+            {
+                vel_ref_enable_eff = false;
+                vel_ref_knot_eff = -1;
+                std::cout << "[vref] auto vel_ref_knot disabled (insufficient points)\n";
+            }
+        }
+
+        if (pos_ref_enable_eff && pos_ref_knot_eff <= 0)
+        {
+            if (auto_knot > 0)
+            {
+                pos_ref_knot_eff = auto_knot;
+                std::cout << "[pref] auto pos_ref_knot=" << pos_ref_knot_eff
+                          << " (route_pts=" << route.size()
+                          << " polys=" << hPolys.size() << ")\n";
+            }
+            else
+            {
+                pos_ref_enable_eff = false;
+                pos_ref_knot_eff = -1;
+                std::cout << "[pref] auto pos_ref_knot disabled (insufficient points)\n";
+            }
+        }
+
         // === 3) Boundary states (pos, vel=0, acc=0)
         Eigen::Matrix3d iniState, finState;
         iniState << start, Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero();
@@ -1231,26 +1413,93 @@ private:
             return;
         }
 
-        if (std::isinf(gcopter.optimize_with_timeout(traj,
-                                                     config.relCostTol,
-                                                     config.opt_timeout_ms,
-                                                     config.lbfgs_mem_size,
-                                                     config.lbfgs_max_linesearch,
-                                                     config.lbfgs_past,
-                                                     config.lbfgs_min_step,
-                                                     config.lbfgs_max_iterations,
-                                                     config.lbfgs_g_epsilon)))
+        // Get shortest path from GCOPTER after setup
+        // shortPath includes start and goal: [start, inner1, inner2, ..., goal]
+        // So shortPath.col(pos_ref_knot) directly gives the position at that knot
+        Eigen::Matrix3Xd shortest_path;
+        gcopter.getShortPath(shortest_path);
+
+        // Auto-compute pos_ref from shortest path
+        Eigen::Vector3d pos_ref_auto = config.posRef;
+        if (pos_ref_enable_eff && pos_ref_knot_eff > 0 &&
+            pos_ref_knot_eff < shortest_path.cols())
+        {
+            pos_ref_auto = shortest_path.col(pos_ref_knot_eff);
+            std::cout << "[pref] auto pos_ref from shortest_path[" << pos_ref_knot_eff << "] = "
+                      << pos_ref_auto.transpose() << "\n";
+        }
+
+        gcopter.setVelRef(vel_ref_enable_eff, vel_ref_knot_eff, config.velRef,
+                          config.velRefWeight, config.velRefGradCheck, config.velRefLogEvery);
+        gcopter.setPosRef(pos_ref_enable_eff, pos_ref_knot_eff, pos_ref_auto,
+                          config.posRefWeight, config.posRefGradCheck, config.posRefLogEvery);
+        gcopter.setFullGradCheck(config.gcopterFullGradCheckEnable,
+                                 config.gcopterFullGradCheckDirs,
+                                 config.gcopterFullGradCheckMaxCoords,
+                                 config.gcopterFullGradCheckEps);
+
+        const double gc_cost = gcopter.optimize_with_timeout(traj,
+                                                             config.relCostTol,
+                                                             config.opt_timeout_ms,
+                                                             config.lbfgs_mem_size,
+                                                             config.lbfgs_max_linesearch,
+                                                             config.lbfgs_past,
+                                                             config.lbfgs_min_step,
+                                                             config.lbfgs_max_iterations,
+                                                             config.lbfgs_g_epsilon);
+        if (std::isinf(gc_cost))
         {
             RCLCPP_ERROR(this->get_logger(), "GCOPTER optimize failed.");
             return;
         }
         double gc_ms = gcopter.getComputationTime();
 
+        if (vel_ref_enable_eff)
+        {
+            Eigen::Vector3d vref_v;
+            double vref_err = 0.0;
+            double vref_cost = 0.0;
+            if (gcopter.getVelRefInfo(vref_v, vref_err, vref_cost))
+            {
+                std::cout << "[GCOPTER][final] vref_knot=" << vel_ref_knot_eff
+                          << " v_i=" << vref_v.transpose()
+                          << " |e|=" << vref_err
+                          << " J_vref=" << vref_cost
+                          << " total=" << gc_cost
+                          << "\n";
+            }
+            else
+            {
+                std::cout << "[GCOPTER][final] vref_knot invalid or disabled in solver\n";
+            }
+        }
+
+        if (pos_ref_enable_eff)
+        {
+            Eigen::Vector3d pref_p;
+            double pref_err = 0.0;
+            double pref_cost = 0.0;
+            if (gcopter.getPosRefInfo(pref_p, pref_err, pref_cost))
+            {
+                std::cout << "[GCOPTER][final] pref_knot=" << pos_ref_knot_eff
+                          << " p_i=" << pref_p.transpose()
+                          << " |e|=" << pref_err
+                          << " J_pref=" << pref_cost
+                          << " total=" << gc_cost
+                          << "\n";
+            }
+            else
+            {
+                std::cout << "[GCOPTER][final] pref_knot invalid or disabled in solver\n";
+            }
+        }
+
         // Visualization + cache (same behavior as plan())
         if (traj.getPieceNum() > 0)
         {
             trajStamp = this->now().seconds();
-            visualizer.visualize(traj, route);
+            visualizer.visualize(traj, route);  // route + waypoints
+            visualizer.visualizeTrajectoryColored(traj, config.maxVelMag);  // velocity-colored trajectory
             visualizer.visualizePolytope(hPolys);
             routeCache_ = route;
             hPolysCache_ = hPolys;
@@ -1265,6 +1514,32 @@ private:
         Metrics M_gc = computeMetricsGCOPTER_sampled_dt(traj, config.sampleDt);
         M_gc.solve_ms = gc_ms;
         M_gc.n_collisions = countCollisionsGCOPTER(traj, hPolys, config.collisionDt, cc_inward_margin, cc_tol);
+
+        // Populate GCOPTER pref/vref errors
+        M_gc.vel_ref = config.velRef;
+        M_gc.pos_ref = pos_ref_auto;
+        M_gc.vref_knot = vel_ref_knot_eff;
+        M_gc.pref_knot = pos_ref_knot_eff;
+        if (vel_ref_enable_eff)
+        {
+            Eigen::Vector3d vref_v;
+            double vref_err = 0.0, vref_cost = 0.0;
+            if (gcopter.getVelRefInfo(vref_v, vref_err, vref_cost))
+            {
+                M_gc.vref_err = vref_err;
+                M_gc.vel_actual = vref_v;
+            }
+        }
+        if (pos_ref_enable_eff)
+        {
+            Eigen::Vector3d pref_p;
+            double pref_err = 0.0, pref_cost = 0.0;
+            if (gcopter.getPosRefInfo(pref_p, pref_err, pref_cost))
+            {
+                M_gc.pref_err = pref_err;
+                M_gc.pos_actual = pref_p;
+            }
+        }
 
         // Initial guess extraction for MIGHTY
         Eigen::Matrix3Xd init_points;
@@ -1309,6 +1584,23 @@ private:
         mighty_cfg.f_max = config.maxThrust;
         mighty_cfg.mass = config.vehicleMass;
         mighty_cfg.g = config.gravAcc;
+        mighty_cfg.vel_ref_enable = vel_ref_enable_eff;
+        mighty_cfg.vel_ref_knot = vel_ref_knot_eff;
+        mighty_cfg.vel_ref = config.velRef;
+        mighty_cfg.vel_ref_weight = config.velRefWeight;
+        mighty_cfg.pos_ref_enable = pos_ref_enable_eff;
+        mighty_cfg.pos_ref_knot = pos_ref_knot_eff;
+        mighty_cfg.pos_ref = pos_ref_auto;
+        mighty_cfg.pos_ref_weight = config.posRefWeight;
+        mighty_cfg.mighty_freeze_enable = config.mightyFreezeEnable;
+        mighty_cfg.vel_ref_grad_check = config.velRefGradCheck;
+        mighty_cfg.vel_ref_log_every = config.velRefLogEvery;
+        mighty_cfg.pos_ref_grad_check = config.posRefGradCheck;
+        mighty_cfg.pos_ref_log_every = config.posRefLogEvery;
+        mighty_cfg.full_grad_check_enable = config.mightyFullGradCheckEnable;
+        mighty_cfg.full_grad_check_dirs = config.mightyFullGradCheckDirs;
+        mighty_cfg.full_grad_check_max_coords = config.mightyFullGradCheckMaxCoords;
+        mighty_cfg.full_grad_check_eps = config.mightyFullGradCheckEps;
 
         // === 7) Build MIGHTY boundary conditions
         state init_state, goal_state;
@@ -1366,6 +1658,28 @@ private:
         M_m.n_collisions = countCollisionsMIGHTY(M_mighty.CP, M_mighty.T, hPolys,
                                                  config.collisionDt, cc_inward_margin, cc_tol);
 
+        // Populate MIGHTY pref/vref errors
+        M_m.vel_ref = Eigen::Vector3d(config.velRef.x(), config.velRef.y(), config.velRef.z());
+        M_m.pos_ref = pos_ref_auto;
+        M_m.vref_knot = vel_ref_knot_eff;
+        M_m.pref_knot = pos_ref_knot_eff;
+        if (vel_ref_enable_eff && vel_ref_knot_eff > 0 &&
+            static_cast<size_t>(vel_ref_knot_eff) < M_mighty.V.size())
+        {
+            const Eigen::Vector3d &v_i = M_mighty.V[vel_ref_knot_eff];
+            const Eigen::Vector3d e = v_i - M_m.vel_ref;
+            M_m.vref_err = e.norm();
+            M_m.vel_actual = v_i;
+        }
+        if (pos_ref_enable_eff && pos_ref_knot_eff > 0 &&
+            static_cast<size_t>(pos_ref_knot_eff) < M_mighty.P.size())
+        {
+            const Eigen::Vector3d &p_i = M_mighty.P[pos_ref_knot_eff];
+            const Eigen::Vector3d e = p_i - M_m.pos_ref;
+            M_m.pref_err = e.norm();
+            M_m.pos_actual = p_i;
+        }
+
         // === 15) Print comparison
         printCompare("GCOPTER", M_gc, "MIGHTY", M_m);
         std::cout << "MIGHTY  solve time [ms]: " << M_mighty.wall_ms << "\n";
@@ -1389,6 +1703,10 @@ private:
             const std::string dir = config.exportCSVDir;
             const std::string f_gc = (dir.back() == '/' ? dir : dir + "/") + "gcopter_vaj.csv";
             const std::string f_my = (dir.back() == '/' ? dir : dir + "/") + "mighty_vaj.csv";
+            const std::string f_gc_knots = (dir.back() == '/' ? dir : dir + "/") + "gcopter_solution_knots.csv";
+            const std::string f_gc_times = (dir.back() == '/' ? dir : dir + "/") + "gcopter_solution_times.csv";
+            const std::string f_my_knots = (dir.back() == '/' ? dir : dir + "/") + "mighty_solution_knots.csv";
+            const std::string f_my_times = (dir.back() == '/' ? dir : dir + "/") + "mighty_solution_times.csv";
 
             writeCSV_GCOPTER(traj, f_gc, config.sampleDt,
                              config.vehicleMass, config.gravAcc,
@@ -1399,6 +1717,17 @@ private:
                             config.vehicleMass, config.gravAcc,
                             config.horizDrag, config.vertDrag, config.parasDrag,
                             config.speedEps);
+
+            if (traj.getPieceNum() > 0)
+            {
+                writeSolutionKnots_GCOPTER(traj, f_gc_knots);
+                writeSolutionTimes_GCOPTER(traj, f_gc_times);
+            }
+            if (!M_mighty.P.empty() && !M_mighty.V.empty() && !M_mighty.A.empty())
+            {
+                writeSolutionKnots_MIGHTY(M_mighty.P, M_mighty.V, M_mighty.A, f_my_knots);
+                writeSolutionTimes_MIGHTY(M_mighty.T, f_my_times);
+            }
         }
     }
 
@@ -1500,6 +1829,7 @@ private:
             visualizer.visualizePolytope(hPolysCache_);
         if (!routeCache_.empty())
             visualizer.visualize(traj, routeCache_);
+        visualizer.visualizeTrajectoryColored(traj, config.maxVelMag);  // velocity-colored GCOPTER
         if (startGoal.size() == 2)
         {
             visualizer.visualizeStartGoal(startGoal[0], 0.5, 0);
@@ -1688,6 +2018,99 @@ private:
         f.close();
     }
 
+    static void writeSolutionKnots_GCOPTER(const Trajectory<5> &traj,
+                                           const std::string &filepath)
+    {
+#if __cplusplus >= 201703L
+        if (!filepath.empty())
+            fs::create_directories(fs::path(filepath).parent_path());
+#endif
+        std::ofstream f(filepath);
+        if (!f.is_open())
+        {
+            std::cerr << "Failed to open " << filepath << "\n";
+            return;
+        }
+
+        f << "idx,px,py,pz\n";
+        const Eigen::Matrix3Xd P = traj.getPositions();
+        for (int i = 0; i < P.cols(); ++i)
+        {
+            f << i << ","
+              << P(0, i) << "," << P(1, i) << "," << P(2, i) << "\n";
+        }
+        f.close();
+    }
+
+    static void writeSolutionTimes_GCOPTER(const Trajectory<5> &traj,
+                                           const std::string &filepath)
+    {
+#if __cplusplus >= 201703L
+        if (!filepath.empty())
+            fs::create_directories(fs::path(filepath).parent_path());
+#endif
+        std::ofstream f(filepath);
+        if (!f.is_open())
+        {
+            std::cerr << "Failed to open " << filepath << "\n";
+            return;
+        }
+
+        f << "seg_idx,T\n";
+        const Eigen::VectorXd T = traj.getDurations();
+        for (int i = 0; i < T.size(); ++i)
+            f << i << "," << T(i) << "\n";
+        f.close();
+    }
+
+    static void writeSolutionKnots_MIGHTY(const std::vector<Eigen::Vector3d> &P,
+                                          const std::vector<Eigen::Vector3d> &V,
+                                          const std::vector<Eigen::Vector3d> &A,
+                                          const std::string &filepath)
+    {
+#if __cplusplus >= 201703L
+        if (!filepath.empty())
+            fs::create_directories(fs::path(filepath).parent_path());
+#endif
+        std::ofstream f(filepath);
+        if (!f.is_open())
+        {
+            std::cerr << "Failed to open " << filepath << "\n";
+            return;
+        }
+
+        f << "idx,px,py,pz,vx,vy,vz,ax,ay,az\n";
+        const size_t N = std::min(P.size(), std::min(V.size(), A.size()));
+        for (size_t i = 0; i < N; ++i)
+        {
+            f << i << ","
+              << P[i].x() << "," << P[i].y() << "," << P[i].z() << ","
+              << V[i].x() << "," << V[i].y() << "," << V[i].z() << ","
+              << A[i].x() << "," << A[i].y() << "," << A[i].z() << "\n";
+        }
+        f.close();
+    }
+
+    static void writeSolutionTimes_MIGHTY(const std::vector<double> &T,
+                                          const std::string &filepath)
+    {
+#if __cplusplus >= 201703L
+        if (!filepath.empty())
+            fs::create_directories(fs::path(filepath).parent_path());
+#endif
+        std::ofstream f(filepath);
+        if (!f.is_open())
+        {
+            std::cerr << "Failed to open " << filepath << "\n";
+            return;
+        }
+
+        f << "seg_idx,T\n";
+        for (size_t i = 0; i < T.size(); ++i)
+            f << i << "," << T[i] << "\n";
+        f.close();
+    }
+
     // Append one row of benchmark stats to CSV (creates file + header on first use)
     static void appendStatsCSV(const std::string &filepath,
                                const Config &cfg,
@@ -1716,7 +2139,13 @@ private:
             f << "stamp,start_x,start_y,start_z,goal_x,goal_y,goal_z,"
                  "max_vel,jerk_weight,sfc_progress,sfc_range,sample_dt,collision_dt,"
                  "gc_solve_ms,gc_time_s,gc_path_len,gc_jerk_cost,gc_collisions,"
-                 "my_solve_ms,my_time_s,my_path_len,my_jerk_cost,my_collisions\n";
+                 "gc_pref_err,gc_vref_err,gc_pref_knot,gc_vref_knot,"
+                 "gc_pos_ref_x,gc_pos_ref_y,gc_pos_ref_z,gc_vel_ref_x,gc_vel_ref_y,gc_vel_ref_z,"
+                 "gc_pos_actual_x,gc_pos_actual_y,gc_pos_actual_z,gc_vel_actual_x,gc_vel_actual_y,gc_vel_actual_z,"
+                 "my_solve_ms,my_time_s,my_path_len,my_jerk_cost,my_collisions,"
+                 "my_pref_err,my_vref_err,my_pref_knot,my_vref_knot,"
+                 "my_pos_ref_x,my_pos_ref_y,my_pos_ref_z,my_vel_ref_x,my_vel_ref_y,my_vel_ref_z,"
+                 "my_pos_actual_x,my_pos_actual_y,my_pos_actual_z,my_vel_actual_x,my_vel_actual_y,my_vel_actual_z\n";
         }
 
         const double stamp = std::chrono::duration<double>(
@@ -1731,7 +2160,17 @@ private:
           << cfg.sfc_progress << "," << cfg.sfc_range << ","
           << cfg.sampleDt << "," << cfg.collisionDt << ","
           << G.solve_ms << "," << G.time_s << "," << G.path_len << "," << G.jerk_cost << "," << G.n_collisions << ","
-          << M.solve_ms << "," << M.time_s << "," << M.path_len << "," << M.jerk_cost << "," << M.n_collisions
+          << G.pref_err << "," << G.vref_err << "," << G.pref_knot << "," << G.vref_knot << ","
+          << G.pos_ref.x() << "," << G.pos_ref.y() << "," << G.pos_ref.z() << ","
+          << G.vel_ref.x() << "," << G.vel_ref.y() << "," << G.vel_ref.z() << ","
+          << G.pos_actual.x() << "," << G.pos_actual.y() << "," << G.pos_actual.z() << ","
+          << G.vel_actual.x() << "," << G.vel_actual.y() << "," << G.vel_actual.z() << ","
+          << M.solve_ms << "," << M.time_s << "," << M.path_len << "," << M.jerk_cost << "," << M.n_collisions << ","
+          << M.pref_err << "," << M.vref_err << "," << M.pref_knot << "," << M.vref_knot << ","
+          << M.pos_ref.x() << "," << M.pos_ref.y() << "," << M.pos_ref.z() << ","
+          << M.vel_ref.x() << "," << M.vel_ref.y() << "," << M.vel_ref.z() << ","
+          << M.pos_actual.x() << "," << M.pos_actual.y() << "," << M.pos_actual.z() << ","
+          << M.vel_actual.x() << "," << M.vel_actual.y() << "," << M.vel_actual.z()
           << "\n";
     }
 };

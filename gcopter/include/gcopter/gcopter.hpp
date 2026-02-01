@@ -31,6 +31,9 @@
 
 #include <Eigen/Eigen>
 
+#include <algorithm>
+#include <numeric>
+#include <random>
 #include <cmath>
 #include <cfloat>
 #include <iostream>
@@ -89,6 +92,38 @@ namespace gcopter
         Eigen::MatrixX3d partialGradByCoeffs;
         Eigen::VectorXd partialGradByTimes;
 
+        // Velocity reference settings (knot velocity soft cost)
+        bool vel_ref_enable_{false};
+        int vel_ref_knot_{-1};
+        Eigen::Vector3d vel_ref_{Eigen::Vector3d::Zero()};
+        double vel_ref_weight_{0.0};
+        bool vel_ref_grad_check_{false};
+        mutable bool vel_ref_grad_check_done_{false};
+        int vel_ref_log_every_{0};
+        // Position reference settings (knot position soft cost)
+        bool pos_ref_enable_{false};
+        int pos_ref_knot_{-1};
+        Eigen::Vector3d pos_ref_{Eigen::Vector3d::Zero()};
+        double pos_ref_weight_{0.0};
+        bool pos_ref_grad_check_{false};
+        mutable bool pos_ref_grad_check_done_{false};
+        int pos_ref_log_every_{0};
+        // Full objective gradient check (GCOPTER)
+        bool full_grad_check_enable_{false};
+        int full_grad_check_dirs_{8};
+        int full_grad_check_max_coords_{256};
+        double full_grad_check_eps_{1e-5};
+        mutable bool full_grad_check_done_{false};
+        mutable bool full_grad_check_running_{false};
+        mutable Eigen::Vector3d last_vref_v_{Eigen::Vector3d::Zero()};
+        mutable double last_vref_err_{0.0};
+        mutable double last_vref_cost_{0.0};
+        mutable bool last_vref_valid_{false};
+        mutable Eigen::Vector3d last_pref_p_{Eigen::Vector3d::Zero()};
+        mutable double last_pref_err_{0.0};
+        mutable double last_pref_cost_{0.0};
+        mutable bool last_pref_valid_{false};
+
         std::vector<Eigen::MatrixX4d> piece_corridor_;
 
         // --- Wall-clock time budget control ---
@@ -115,7 +150,7 @@ namespace gcopter
             const Eigen::VectorXd &g,
             const double fx,
             const double /*step*/,
-            const int /*k*/,
+            const int k,
             const int /*ls*/)
         {
             auto *self = static_cast<GCOPTER_PolytopeSFC *>(instance);
@@ -125,6 +160,32 @@ namespace gcopter
             {
                 self->best_f_ = fx;
                 self->best_x_ = x; // copy
+            }
+
+            const bool log_vref = self->vel_ref_enable_ && self->vel_ref_log_every_ > 0 &&
+                                  (k % self->vel_ref_log_every_ == 0);
+            const bool log_pref = self->pos_ref_enable_ && self->pos_ref_log_every_ > 0 &&
+                                  (k % self->pos_ref_log_every_ == 0);
+            if (log_vref || log_pref)
+            {
+                std::cout << "[GCOPTER][iter " << k << "] ";
+                if (log_vref)
+                {
+                    std::cout << "vref_knot=" << self->vel_ref_knot_
+                              << " v_i=" << self->last_vref_v_.transpose()
+                              << " |e|=" << self->last_vref_err_
+                              << " J_vref=" << self->last_vref_cost_;
+                }
+                if (log_pref)
+                {
+                    if (log_vref)
+                        std::cout << " ";
+                    std::cout << "pref_knot=" << self->pos_ref_knot_
+                              << " p_i=" << self->last_pref_p_.transpose()
+                              << " |e_p|=" << self->last_pref_err_
+                              << " J_pref=" << self->last_pref_cost_;
+                }
+                std::cout << " f=" << fx << "\n";
             }
 
             if (!self->time_budget_enabled_)
@@ -397,6 +458,97 @@ namespace gcopter
             }
         }
 
+        // Soft velocity reference at a knot (uses left segment endpoint).
+        // Adds cost and partial gradients in coefficient/time space.
+        static inline bool attachVelRefFunctional(const Eigen::VectorXd &T,
+                                                  const Eigen::MatrixX3d &coeffs,
+                                                  const int knot_i,
+                                                  const Eigen::Vector3d &v_ref,
+                                                  const double weight,
+                                                  double &cost,
+                                                  Eigen::VectorXd &gradT,
+                                                  Eigen::MatrixX3d &gradC,
+                                                  Eigen::Vector3d *v_out = nullptr,
+                                                  Eigen::Vector3d *a_out = nullptr)
+        {
+            const int pieceNum = T.size();
+            if (weight <= 0.0 || knot_i <= 0 || knot_i >= pieceNum)
+                return false;
+
+            const int s = knot_i - 1;
+            const double t = T(s);
+            const double t2 = t * t;
+            const double t3 = t2 * t;
+            const double t4 = t3 * t;
+
+            Eigen::Matrix<double, 6, 1> beta1, beta2;
+            beta1 << 0.0, 1.0, 2.0 * t, 3.0 * t2, 4.0 * t3, 5.0 * t4;
+            beta2 << 0.0, 0.0, 2.0, 6.0 * t, 12.0 * t2, 20.0 * t3;
+
+            const Eigen::Matrix<double, 6, 3> c = coeffs.block<6, 3>(s * 6, 0);
+            const Eigen::Vector3d v = c.transpose() * beta1;
+            const Eigen::Vector3d a = c.transpose() * beta2;
+            const Eigen::Vector3d e = v - v_ref;
+            const Eigen::Vector3d gv = weight * e;
+
+            cost += 0.5 * weight * e.squaredNorm();
+            gradC.block<6, 3>(s * 6, 0) += beta1 * gv.transpose();
+            gradT(s) += gv.dot(a);
+
+            if (v_out)
+                *v_out = v;
+            if (a_out)
+                *a_out = a;
+
+            return true;
+        }
+
+        // Soft position reference at a knot (uses left segment endpoint).
+        // Adds cost and partial gradients in coefficient/time space.
+        static inline bool attachPosRefFunctional(const Eigen::VectorXd &T,
+                                                  const Eigen::MatrixX3d &coeffs,
+                                                  const int knot_i,
+                                                  const Eigen::Vector3d &p_ref,
+                                                  const double weight,
+                                                  double &cost,
+                                                  Eigen::VectorXd &gradT,
+                                                  Eigen::MatrixX3d &gradC,
+                                                  Eigen::Vector3d *p_out = nullptr,
+                                                  Eigen::Vector3d *v_out = nullptr)
+        {
+            const int pieceNum = T.size();
+            if (weight <= 0.0 || knot_i <= 0 || knot_i >= pieceNum)
+                return false;
+
+            const int s = knot_i - 1;
+            const double t = T(s);
+            const double t2 = t * t;
+            const double t3 = t2 * t;
+            const double t4 = t3 * t;
+            const double t5 = t4 * t;
+
+            Eigen::Matrix<double, 6, 1> beta0, beta1;
+            beta0 << 1.0, t, t2, t3, t4, t5;
+            beta1 << 0.0, 1.0, 2.0 * t, 3.0 * t2, 4.0 * t3, 5.0 * t4;
+
+            const Eigen::Matrix<double, 6, 3> c = coeffs.block<6, 3>(s * 6, 0);
+            const Eigen::Vector3d p = c.transpose() * beta0;
+            const Eigen::Vector3d v = c.transpose() * beta1;
+            const Eigen::Vector3d e = p - p_ref;
+            const Eigen::Vector3d gp = weight * e;
+
+            cost += 0.5 * weight * e.squaredNorm();
+            gradC.block<6, 3>(s * 6, 0) += beta0 * gp.transpose();
+            gradT(s) += gp.dot(v);
+
+            if (p_out)
+                *p_out = p;
+            if (v_out)
+                *v_out = v;
+
+            return true;
+        }
+
         // magnitudeBounds = [v_max, omg_max, theta_max, thrust_min, thrust_max]^T
         // penaltyWeights = [pos_weight, vel_weight, omg_weight, theta_weight, thrust_weight]^T
         // physicalParams = [vehicle_mass, gravitational_acceleration, horitonral_drag_coeff,
@@ -575,6 +727,66 @@ namespace gcopter
                                     obj.magnitudeBd, obj.penaltyWt, obj.flatmap,
                                     cost, obj.partialGradByTimes, obj.partialGradByCoeffs);
 
+            // Velocity reference soft cost (knot velocity)
+            if (obj.vel_ref_enable_)
+            {
+                Eigen::Vector3d v_i;
+                obj.last_vref_valid_ = attachVelRefFunctional(obj.times, obj.minco.getCoeffs(),
+                                                             obj.vel_ref_knot_, obj.vel_ref_, obj.vel_ref_weight_,
+                                                             cost, obj.partialGradByTimes, obj.partialGradByCoeffs,
+                                                             &v_i, nullptr);
+                if (obj.last_vref_valid_)
+                {
+                    const Eigen::Vector3d e = v_i - obj.vel_ref_;
+                    obj.last_vref_v_ = v_i;
+                    obj.last_vref_err_ = e.norm();
+                    obj.last_vref_cost_ = 0.5 * obj.vel_ref_weight_ * e.squaredNorm();
+                }
+                else
+                {
+                    obj.last_vref_v_.setZero();
+                    obj.last_vref_err_ = 0.0;
+                    obj.last_vref_cost_ = 0.0;
+                }
+            }
+            else
+            {
+                obj.last_vref_valid_ = false;
+                obj.last_vref_v_.setZero();
+                obj.last_vref_err_ = 0.0;
+                obj.last_vref_cost_ = 0.0;
+            }
+
+            // Position reference soft cost (knot position)
+            if (obj.pos_ref_enable_)
+            {
+                Eigen::Vector3d p_i;
+                obj.last_pref_valid_ = attachPosRefFunctional(obj.times, obj.minco.getCoeffs(),
+                                                             obj.pos_ref_knot_, obj.pos_ref_, obj.pos_ref_weight_,
+                                                             cost, obj.partialGradByTimes, obj.partialGradByCoeffs,
+                                                             &p_i, nullptr);
+                if (obj.last_pref_valid_)
+                {
+                    const Eigen::Vector3d e = p_i - obj.pos_ref_;
+                    obj.last_pref_p_ = p_i;
+                    obj.last_pref_err_ = e.norm();
+                    obj.last_pref_cost_ = 0.5 * obj.pos_ref_weight_ * e.squaredNorm();
+                }
+                else
+                {
+                    obj.last_pref_p_.setZero();
+                    obj.last_pref_err_ = 0.0;
+                    obj.last_pref_cost_ = 0.0;
+                }
+            }
+            else
+            {
+                obj.last_pref_valid_ = false;
+                obj.last_pref_p_.setZero();
+                obj.last_pref_err_ = 0.0;
+                obj.last_pref_cost_ = 0.0;
+            }
+
             obj.minco.propogateGrad(obj.partialGradByCoeffs, obj.partialGradByTimes,
                                     obj.gradByPoints, obj.gradByTimes);
 
@@ -585,7 +797,298 @@ namespace gcopter
             backwardGradP(xi, obj.vPolyIdx, obj.vPolytopes, obj.gradByPoints, gradXi);
             normRetrictionLayer(xi, obj.vPolyIdx, obj.vPolytopes, cost, gradXi);
 
+            // Optional one-shot gradient check for vref term only
+            if (obj.vel_ref_grad_check_)
+            {
+                obj.checkVelRefGradOnce(x);
+            }
+
+            // Optional one-shot gradient check for pref term only
+            if (obj.pos_ref_grad_check_)
+            {
+                obj.checkPosRefGradOnce(x);
+            }
+
+            // Optional one-shot gradient check for full objective
+            if (obj.full_grad_check_enable_ && !obj.full_grad_check_running_)
+            {
+                obj.checkFullGradOnce(x, gradTau, gradXi);
+            }
+
             return cost;
+        }
+
+        inline void checkVelRefGradOnce(const Eigen::VectorXd &x)
+        {
+            if (!vel_ref_grad_check_ || vel_ref_grad_check_done_)
+                return;
+            if (!vel_ref_enable_ || vel_ref_weight_ <= 0.0)
+                return;
+            if (vel_ref_knot_ <= 0 || vel_ref_knot_ >= temporalDim)
+                return;
+
+            vel_ref_grad_check_done_ = true;
+
+            const int dimTau = temporalDim;
+            const int dimXi = spatialDim;
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), dimTau);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dimTau, dimXi);
+
+            // Helper: vref-only cost
+            auto costOnly = [&](const Eigen::VectorXd &x_in) -> double
+            {
+                Eigen::Map<const Eigen::VectorXd> tau_in(x_in.data(), dimTau);
+                Eigen::Map<const Eigen::VectorXd> xi_in(x_in.data() + dimTau, dimXi);
+                forwardT(tau_in, times);
+                forwardP(xi_in, vPolyIdx, vPolytopes, points);
+                minco.setParameters(points, times);
+                double cost_local = 0.0;
+                partialGradByCoeffs.setZero();
+                partialGradByTimes.setZero();
+                attachVelRefFunctional(times, minco.getCoeffs(), vel_ref_knot_, vel_ref_, vel_ref_weight_,
+                                       cost_local, partialGradByTimes, partialGradByCoeffs,
+                                       nullptr, nullptr);
+                return cost_local;
+            };
+
+            // Analytic gradient for vref-only term
+            forwardT(tau, times);
+            forwardP(xi, vPolyIdx, vPolytopes, points);
+            minco.setParameters(points, times);
+            partialGradByCoeffs.setZero();
+            partialGradByTimes.setZero();
+            double cost_vref = 0.0;
+            attachVelRefFunctional(times, minco.getCoeffs(), vel_ref_knot_, vel_ref_, vel_ref_weight_,
+                                   cost_vref, partialGradByTimes, partialGradByCoeffs,
+                                   nullptr, nullptr);
+            minco.propogateGrad(partialGradByCoeffs, partialGradByTimes,
+                                gradByPoints, gradByTimes);
+
+            Eigen::VectorXd gradTau(dimTau);
+            Eigen::VectorXd gradXi(dimXi);
+            backwardGradT(tau, gradByTimes, gradTau);
+            backwardGradP(xi, vPolyIdx, vPolytopes, gradByPoints, gradXi);
+
+            Eigen::VectorXd gradAnalytic(x.size());
+            gradAnalytic.setZero();
+            gradAnalytic.head(dimTau) = gradTau;
+            gradAnalytic.tail(dimXi) = gradXi;
+
+            const double eps = 1e-6;
+            std::cout << "[GCOPTER][vref-grad] knot=" << vel_ref_knot_ << "\n";
+
+            // Check one tau dimension (segment tied to knot)
+            const int s_check = std::clamp(vel_ref_knot_ - 1, 0, dimTau - 1);
+            {
+                Eigen::VectorXd xp = x, xm = x;
+                xp[s_check] += eps;
+                xm[s_check] -= eps;
+                const double fd = (costOnly(xp) - costOnly(xm)) / (2.0 * eps);
+                const double ad = gradAnalytic[s_check];
+                const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+                const double rel = std::abs(fd - ad) / denom;
+                std::cout << "  tau[" << s_check << "] fd=" << fd << " ad=" << ad << " rel=" << rel << "\n";
+            }
+
+            // Check one xi dimension with largest magnitude (if any)
+            if (dimXi > 0)
+            {
+                int idx_xi = 0;
+                double max_abs = 0.0;
+                for (int i = 0; i < dimXi; ++i)
+                {
+                    const double a = std::abs(gradXi[i]);
+                    if (a > max_abs)
+                    {
+                        max_abs = a;
+                        idx_xi = i;
+                    }
+                }
+                const int idx = dimTau + idx_xi;
+                Eigen::VectorXd xp = x, xm = x;
+                xp[idx] += eps;
+                xm[idx] -= eps;
+                const double fd = (costOnly(xp) - costOnly(xm)) / (2.0 * eps);
+                const double ad = gradAnalytic[idx];
+                const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+                const double rel = std::abs(fd - ad) / denom;
+                std::cout << "  xi[" << idx_xi << "] fd=" << fd << " ad=" << ad << " rel=" << rel << "\n";
+            }
+        }
+
+        inline void checkPosRefGradOnce(const Eigen::VectorXd &x)
+        {
+            if (!pos_ref_grad_check_ || pos_ref_grad_check_done_)
+                return;
+            if (!pos_ref_enable_ || pos_ref_weight_ <= 0.0)
+                return;
+            if (pos_ref_knot_ <= 0 || pos_ref_knot_ >= temporalDim)
+                return;
+
+            pos_ref_grad_check_done_ = true;
+
+            const int dimTau = temporalDim;
+            const int dimXi = spatialDim;
+            Eigen::Map<const Eigen::VectorXd> tau(x.data(), dimTau);
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dimTau, dimXi);
+
+            // Helper: pref-only cost
+            auto costOnly = [&](const Eigen::VectorXd &x_in) -> double
+            {
+                Eigen::Map<const Eigen::VectorXd> tau_in(x_in.data(), dimTau);
+                Eigen::Map<const Eigen::VectorXd> xi_in(x_in.data() + dimTau, dimXi);
+                forwardT(tau_in, times);
+                forwardP(xi_in, vPolyIdx, vPolytopes, points);
+                minco.setParameters(points, times);
+                double cost_local = 0.0;
+                partialGradByCoeffs.setZero();
+                partialGradByTimes.setZero();
+                attachPosRefFunctional(times, minco.getCoeffs(), pos_ref_knot_, pos_ref_, pos_ref_weight_,
+                                       cost_local, partialGradByTimes, partialGradByCoeffs,
+                                       nullptr, nullptr);
+                return cost_local;
+            };
+
+            // Analytic gradient for pref-only term
+            forwardT(tau, times);
+            forwardP(xi, vPolyIdx, vPolytopes, points);
+            minco.setParameters(points, times);
+            partialGradByCoeffs.setZero();
+            partialGradByTimes.setZero();
+            double cost_pref = 0.0;
+            attachPosRefFunctional(times, minco.getCoeffs(), pos_ref_knot_, pos_ref_, pos_ref_weight_,
+                                   cost_pref, partialGradByTimes, partialGradByCoeffs,
+                                   nullptr, nullptr);
+            minco.propogateGrad(partialGradByCoeffs, partialGradByTimes,
+                                gradByPoints, gradByTimes);
+
+            Eigen::VectorXd gradTau(dimTau);
+            Eigen::VectorXd gradXi(dimXi);
+            backwardGradT(tau, gradByTimes, gradTau);
+            backwardGradP(xi, vPolyIdx, vPolytopes, gradByPoints, gradXi);
+
+            Eigen::VectorXd gradAnalytic(x.size());
+            gradAnalytic.setZero();
+            gradAnalytic.head(dimTau) = gradTau;
+            gradAnalytic.tail(dimXi) = gradXi;
+
+            const double eps = 1e-6;
+            std::cout << "[GCOPTER][pref-grad] knot=" << pos_ref_knot_ << "\n";
+
+            // Check one tau dimension (segment tied to knot)
+            const int s_check = std::clamp(pos_ref_knot_ - 1, 0, dimTau - 1);
+            {
+                Eigen::VectorXd xp = x, xm = x;
+                xp[s_check] += eps;
+                xm[s_check] -= eps;
+                const double fd = (costOnly(xp) - costOnly(xm)) / (2.0 * eps);
+                const double ad = gradAnalytic[s_check];
+                const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+                const double rel = std::abs(fd - ad) / denom;
+                std::cout << "  tau[" << s_check << "] fd=" << fd << " ad=" << ad << " rel=" << rel << "\n";
+            }
+
+            // Check one xi dimension with largest magnitude (if any)
+            if (dimXi > 0)
+            {
+                int idx_xi = 0;
+                double max_abs = 0.0;
+                for (int i = 0; i < dimXi; ++i)
+                {
+                    const double a = std::abs(gradXi[i]);
+                    if (a > max_abs)
+                    {
+                        max_abs = a;
+                        idx_xi = i;
+                    }
+                }
+                const int idx = dimTau + idx_xi;
+                Eigen::VectorXd xp = x, xm = x;
+                xp[idx] += eps;
+                xm[idx] -= eps;
+                const double fd = (costOnly(xp) - costOnly(xm)) / (2.0 * eps);
+                const double ad = gradAnalytic[idx];
+                const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+                const double rel = std::abs(fd - ad) / denom;
+                std::cout << "  xi[" << idx_xi << "] fd=" << fd << " ad=" << ad << " rel=" << rel << "\n";
+            }
+        }
+
+        inline void checkFullGradOnce(const Eigen::VectorXd &x,
+                                      const Eigen::VectorXd &gradTau,
+                                      const Eigen::VectorXd &gradXi)
+        {
+            if (!full_grad_check_enable_ || full_grad_check_done_ || full_grad_check_running_)
+                return;
+            full_grad_check_done_ = true;
+
+            const int dimTau = temporalDim;
+            const int dimXi = spatialDim;
+            Eigen::VectorXd gradAnalytic(x.size());
+            gradAnalytic.setZero();
+            gradAnalytic.head(dimTau) = gradTau;
+            gradAnalytic.tail(dimXi) = gradXi;
+
+            auto costOnly = [&](const Eigen::VectorXd &xin) -> double
+            {
+                full_grad_check_running_ = true;
+                Eigen::VectorXd gtmp = Eigen::VectorXd::Zero(xin.size());
+                double c = GCOPTER_PolytopeSFC::costFunctional(this, xin, gtmp);
+                full_grad_check_running_ = false;
+                return c;
+            };
+
+            std::mt19937 rng(42);
+            std::normal_distribution<double> N(0.0, 1.0);
+
+            double max_rel_dir = 0.0;
+            for (int k = 0; k < full_grad_check_dirs_; ++k)
+            {
+                Eigen::VectorXd d(x.size());
+                for (int i = 0; i < d.size(); ++i)
+                    d[i] = N(rng);
+                const double n = d.norm();
+                if (n < 1e-12)
+                {
+                    --k;
+                    continue;
+                }
+                d /= n;
+                const double eps = full_grad_check_eps_;
+                const double fd = (costOnly(x + eps * d) - costOnly(x - eps * d)) / (2.0 * eps);
+                const double ad = gradAnalytic.dot(d);
+                const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+                const double rel = std::abs(fd - ad) / denom;
+                max_rel_dir = std::max(max_rel_dir, rel);
+                if (rel > 1e-3)
+                    std::cout << "[GCOPTER][full-grad][dir " << k << "] fd=" << fd << " ad=" << ad
+                              << " rel_err=" << rel << "\n";
+            }
+
+            std::vector<int> idx(x.size());
+            std::iota(idx.begin(), idx.end(), 0);
+            std::shuffle(idx.begin(), idx.end(), rng);
+            if ((int)idx.size() > full_grad_check_max_coords_)
+                idx.resize(full_grad_check_max_coords_);
+
+            double max_rel_coord = 0.0;
+            for (int i : idx)
+            {
+                Eigen::VectorXd ei = Eigen::VectorXd::Zero(x.size());
+                ei[i] = 1.0;
+                const double eps = full_grad_check_eps_;
+                const double fd = (costOnly(x + eps * ei) - costOnly(x - eps * ei)) / (2.0 * eps);
+                const double ad = gradAnalytic[i];
+                const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+                const double rel = std::abs(fd - ad) / denom;
+                max_rel_coord = std::max(max_rel_coord, rel);
+                if (rel > 1e-3)
+                    std::cout << "[GCOPTER][full-grad][idx " << i << "] g_fd=" << fd << " g_ad=" << ad
+                              << " rel_err=" << rel << "\n";
+            }
+
+            std::cout << "[GCOPTER][full-grad] max_rel_dir=" << max_rel_dir
+                      << " max_rel_coord=" << max_rel_coord << "\n";
         }
 
         static inline double costDistance(void *ptr,
@@ -887,9 +1390,127 @@ namespace gcopter
             return true;
         }
 
+        inline void setVelRef(const bool enable,
+                              const int knot,
+                              const Eigen::Vector3d &vref,
+                              const double weight,
+                              const bool grad_check = false,
+                              const int log_every = 0)
+        {
+            vel_ref_enable_ = enable;
+            vel_ref_knot_ = knot;
+            vel_ref_ = vref;
+            vel_ref_weight_ = weight;
+            vel_ref_grad_check_ = grad_check;
+            vel_ref_grad_check_done_ = false;
+            vel_ref_log_every_ = log_every;
+            if (vel_ref_enable_)
+            {
+                if (vel_ref_knot_ <= 0 || vel_ref_knot_ >= pieceN)
+                {
+                    std::cout << "[GCOPTER] warning: VelRefKnot=" << vel_ref_knot_
+                              << " out of range (valid: 1.." << (pieceN - 1) << ")\n";
+                }
+                std::cout << "[GCOPTER] vref enabled: gradients injected in coeff/time space, "
+                          << "then propagated by MINCO.\n";
+            }
+        }
+
+        inline void setPosRef(const bool enable,
+                              const int knot,
+                              const Eigen::Vector3d &pref,
+                              const double weight,
+                              const bool grad_check = false,
+                              const int log_every = 0)
+        {
+            pos_ref_enable_ = enable;
+            pos_ref_knot_ = knot;
+            pos_ref_ = pref;
+            pos_ref_weight_ = weight;
+            pos_ref_grad_check_ = grad_check;
+            pos_ref_grad_check_done_ = false;
+            pos_ref_log_every_ = log_every;
+            if (pos_ref_enable_)
+            {
+                if (pos_ref_knot_ <= 0 || pos_ref_knot_ >= pieceN)
+                {
+                    std::cout << "[GCOPTER] warning: PosRefKnot=" << pos_ref_knot_
+                              << " out of range (valid: 1.." << (pieceN - 1) << ")\n";
+                }
+                std::cout << "[GCOPTER] pref enabled: gradients injected in coeff/time space, "
+                          << "then propagated by MINCO.\n";
+            }
+        }
+
+        inline void setFullGradCheck(const bool enable,
+                                     const int dirs,
+                                     const int max_coords,
+                                     const double eps)
+        {
+            full_grad_check_enable_ = enable;
+            full_grad_check_dirs_ = std::max(1, dirs);
+            full_grad_check_max_coords_ = std::max(1, max_coords);
+            full_grad_check_eps_ = (eps > 0.0 ? eps : 1e-5);
+            full_grad_check_done_ = false;
+        }
+
+        inline bool getVelRefInfo(Eigen::Vector3d &v_out,
+                                  double &err_out,
+                                  double &J_out) const
+        {
+            if (!vel_ref_enable_ || vel_ref_weight_ <= 0.0)
+                return false;
+            if (vel_ref_knot_ <= 0 || vel_ref_knot_ >= times.size())
+                return false;
+            const int s = vel_ref_knot_ - 1;
+            const double t = times(s);
+            const double t2 = t * t;
+            const double t3 = t2 * t;
+            const double t4 = t3 * t;
+            Eigen::Matrix<double, 6, 1> beta1;
+            beta1 << 0.0, 1.0, 2.0 * t, 3.0 * t2, 4.0 * t3, 5.0 * t4;
+            const Eigen::Matrix<double, 6, 3> c = minco.getCoeffs().block<6, 3>(s * 6, 0);
+            v_out = c.transpose() * beta1;
+            const Eigen::Vector3d e = v_out - vel_ref_;
+            err_out = e.norm();
+            J_out = 0.5 * vel_ref_weight_ * e.squaredNorm();
+            return true;
+        }
+
+        inline bool getPosRefInfo(Eigen::Vector3d &p_out,
+                                  double &err_out,
+                                  double &J_out) const
+        {
+            if (!pos_ref_enable_ || pos_ref_weight_ <= 0.0)
+                return false;
+            if (pos_ref_knot_ <= 0 || pos_ref_knot_ >= times.size())
+                return false;
+            const int s = pos_ref_knot_ - 1;
+            const double t = times(s);
+            const double t2 = t * t;
+            const double t3 = t2 * t;
+            const double t4 = t3 * t;
+            const double t5 = t4 * t;
+            Eigen::Matrix<double, 6, 1> beta0;
+            beta0 << 1.0, t, t2, t3, t4, t5;
+            const Eigen::Matrix<double, 6, 3> c = minco.getCoeffs().block<6, 3>(s * 6, 0);
+            p_out = c.transpose() * beta0;
+            const Eigen::Vector3d e = p_out - pos_ref_;
+            err_out = e.norm();
+            J_out = 0.5 * pos_ref_weight_ * e.squaredNorm();
+            return true;
+        }
+
         inline void getVPolytopes(PolyhedraV &vPs) const
         {
             vPs = vPolytopes;
+        }
+
+        // Get shortest path computed during setup()
+        // shortPath includes start and goal: [start, inner1, inner2, ..., goal]
+        inline void getShortPath(Eigen::Matrix3Xd &path) const
+        {
+            path = shortPath;
         }
 
         inline double optimize_with_timeout(Trajectory<5> &traj,

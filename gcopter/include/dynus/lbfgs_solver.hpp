@@ -18,6 +18,7 @@
 #include <dynus/lbfgs_solver_utils.hpp>
 #include <numeric>
 #include <cmath> // for std::log, std::pow
+#include <string>
 #include <gcopter/lbfgs.hpp>
 #include <omp.h>
 #include <set>
@@ -91,6 +92,26 @@ namespace lbfgs
         double f_max = 20.0;                   // max thrust in N
         double mass = 1.0;                     // mass in kg
         double g = 9.81;                       // gravity in m/s^2
+        // Velocity reference (knot velocity soft cost / freeze)
+        bool vel_ref_enable = false;
+        int vel_ref_knot = -1; // interior knot index [1..M-1]
+        Eigen::Vector3d vel_ref = Eigen::Vector3d::Zero();
+        double vel_ref_weight = 0.0;
+        // Position reference (knot position soft cost)
+        bool pos_ref_enable = false;
+        int pos_ref_knot = -1; // interior knot index [1..M-1]
+        Eigen::Vector3d pos_ref = Eigen::Vector3d::Zero();
+        double pos_ref_weight = 0.0;
+        bool mighty_freeze_enable = false;
+        bool vel_ref_grad_check = false;
+        bool pos_ref_grad_check = false;
+        int vel_ref_log_every = 0; // <=0: no per-iter logs; N>0: print every N iters
+        int pos_ref_log_every = 0; // <=0: no per-iter logs; N>0: print every N iters
+        // Full objective gradient check (MIGHTY)
+        bool full_grad_check_enable = false;
+        int full_grad_check_dirs = 8;
+        int full_grad_check_max_coords = 256;
+        double full_grad_check_eps = 1e-5;
     };
 
     class SolverLBFGS
@@ -141,6 +162,9 @@ namespace lbfgs
          * @return   Scalar value of the objective at z
          */
         double evaluateObjective(const VecXd &z);
+
+        // Print the last objective breakdown (updated in evaluateObjectiveAndGradientFused).
+        void printObjectiveBreakdown(const std::string &tag) const;
 
         // -----------------------------------------------------------------------------
 
@@ -625,6 +649,49 @@ namespace lbfgs
         std::vector<Vec3> P_opt_, V_opt_, A_opt_;
         double t0_{0.0}; // start time of the trajectory
 
+        // Velocity reference settings
+        bool vel_ref_enable_{false};
+        int vel_ref_knot_{-1};
+        Vec3 vel_ref_{Vec3::Zero()};
+        double vel_ref_weight_{0.0};
+        // Position reference settings
+        bool pos_ref_enable_{false};
+        int pos_ref_knot_{-1};
+        Vec3 pos_ref_{Vec3::Zero()};
+        double pos_ref_weight_{0.0};
+        bool mighty_freeze_enable_{false};
+        bool vel_ref_grad_check_{false};
+        mutable bool vel_ref_grad_check_done_{false};
+        bool pos_ref_grad_check_{false};
+        mutable bool pos_ref_grad_check_done_{false};
+        int vel_ref_log_every_{0};
+        int pos_ref_log_every_{0};
+        // Full objective gradient check (MIGHTY)
+        bool full_grad_check_enable_{false};
+        int full_grad_check_dirs_{8};
+        int full_grad_check_max_coords_{256};
+        double full_grad_check_eps_{1e-5};
+
+        // Last-iteration vref diagnostics
+        mutable Vec3 last_vref_v_{Vec3::Zero()};
+        mutable double last_vref_err_{0.0};
+        mutable double last_vref_cost_{0.0};
+        // Last-iteration pref diagnostics
+        mutable Vec3 last_pref_p_{Vec3::Zero()};
+        mutable double last_pref_err_{0.0};
+        mutable double last_pref_cost_{0.0};
+
+        // Last-iteration objective breakdown (unweighted costs except vref/pref which are already weighted)
+        mutable double last_J_time_{0.0};
+        mutable double last_J_jerk_{0.0};
+        mutable double last_J_stat_{0.0};
+        mutable double last_J_vel_{0.0};
+        mutable double last_J_om_{0.0};
+        mutable double last_J_tilt_{0.0};
+        mutable double last_J_thr_{0.0};
+        mutable double last_J_vref_{0.0};
+        mutable double last_J_pref_{0.0};
+
         // >>> add to SolverLBFGS class (private:)
         PolyhedraV vPolys_OB_;         // [poly0, inter01, poly1, inter12, ..., polyM]
         Eigen::VectorXi seamSizes_;    // k_i = vPolys_OB_[2*i-1].cols() for i=1..M-1 (intersections)
@@ -690,6 +757,15 @@ namespace lbfgs
             else
                 grad.segment<3>(9 * i + 6) += g;
         }
+
+        // Hard projection for frozen velocity reference (in-place on z).
+        void projectFrozenVarsInPlace(Eigen::VectorXd &z) const;
+
+        // Optional finite-difference check for position reference term.
+        void checkPosRefGradOnce(const Eigen::VectorXd &z0) const;
+
+        // Optional finite-difference check for velocity reference term.
+        void checkVelRefGradOnce(const Eigen::VectorXd &z0) const;
 
     }; // class SolverLBFGS
 

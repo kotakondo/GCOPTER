@@ -60,6 +60,32 @@ def main():
     ap.add_argument("--mighty_jerk_weight", type=float, default=1e-3)
     ap.add_argument("--sample_dt", default="0.01")
     ap.add_argument("--collision_dt", default="0.01")
+    ap.add_argument("--vel_ref", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                    help="Velocity reference vector (x y z)")
+    ap.add_argument("--vel_ref_weight", type=float, default=0.0,
+                    help="Soft vref weight used in soft/freeze modes")
+    ap.add_argument("--vel_ref_knot", type=int, default=-1,
+                    help="Knot index (<=0 => auto penultimate per case)")
+    ap.add_argument("--vel_ref_log_every", type=int, default=0,
+                    help="Per-iter logging period (0 disables)")
+    ap.add_argument("--vel_ref_grad_check", action="store_true",
+                    help="Enable one-shot FD check (prints once per case)")
+    ap.add_argument("--pos_ref", type=float, nargs=3, default=[0.0, 0.0, 0.0],
+                    help="Position reference vector (x y z)")
+    ap.add_argument("--pos_ref_weight", type=float, default=0.0,
+                    help="Soft pref weight used in soft/freeze modes")
+    ap.add_argument("--pos_ref_knot", type=int, default=-1,
+                    help="Knot index (<=0 => auto penultimate per case)")
+    ap.add_argument("--pos_ref_log_every", type=int, default=0,
+                    help="Per-iter logging period (0 disables)")
+    ap.add_argument("--pos_ref_grad_check", action="store_true",
+                    help="Enable one-shot FD check for position ref (prints once per case)")
+    ap.add_argument("--pos_ref_enable", action="store_true",
+                    help="Enable position reference term (only in soft/freeze modes)")
+    ap.add_argument("--skip_freeze", action="store_true",
+                    help="Skip the MIGHTY-freeze mode (run baseline + soft only)")
+    ap.add_argument("--skip_baseline", action="store_true",
+                    help="Skip the baseline mode (run soft only, or soft+freeze)")
     ap.add_argument("--no_sweep_mighty_jerk_weight", action="store_true", help="Disable sweep and use --mighty_jerk_weight")
     ap.add_argument("--sweep_min", type=float, default=1e-5, help="Sweep min value (log10 space)")
     ap.add_argument("--sweep_max", type=float, default=1e+3, help="Sweep max value (log10 space)")
@@ -103,39 +129,67 @@ def main():
             weight_root = os.path.join(args.out_root, f"weight_{w_str}")
             os.makedirs(weight_root, exist_ok=True)
 
-            if args.use_cpp_batch:
-                node_cmd = [
-                    "ros2", "launch", args.pkg_node, args.node_launch,
-                    f"max_vel:={args.max_vel}",
-                    f"mighty_jerk_weight:={w}",
-                    f"sample_dt:={args.sample_dt}",
-                    f"collision_dt:={args.collision_dt}",
-                    "corridorMode:=3",  # 3=batch load+run
-                    f"corridorBatchRoot:={args.corridor_root}",
-                    f"corridorBatchOutRoot:={weight_root}",
-                    f"corridorBatchStart:={args.goal_start}",
-                    f"corridorBatchCount:={args.n_runs}",
-                    "corridorBatchGoalWidth:=3",
-                    "corridorNoMap:=true",
-                    "do_benchmark:=true",
-                ]
-                node = start_proc(node_cmd, f"bench_batch[{w_str}]")
-                t0 = time.time()
-                try:
-                    if args.case_timeout > 0:
-                        total_timeout = args.case_timeout * max(1, args.n_runs)
-                        rc = node.wait(timeout=total_timeout)
-                    else:
-                        rc = node.wait()
-                except subprocess.TimeoutExpired:
-                    print(f"[bench2] bench_batch[{w_str}] timed out; killing")
-                    kill_proc_group(node, f"bench_batch[{w_str}]")
-                    rc = -9
-                print(f"[bench2] done bench_batch[{w_str}] rc={rc} wall={time.time()-t0:.2f}s")
+            # Three modes per case
+            modes = [
+                ("baseline", False, False),
+                ("soft", True, False),
+                ("freeze", True, True),
+            ]
+            if args.skip_freeze:
+                modes = [m for m in modes if m[0] != "freeze"]
+            if args.skip_baseline:
+                modes = [m for m in modes if m[0] != "baseline"]
 
-                if rc != 0:
-                    print("[bench2] non-zero rc, aborting remaining runs.")
-                    break
+            if args.use_cpp_batch:
+                for mode_name, vref_enable, freeze_enable in modes:
+                    pref_enable = args.pos_ref_enable and vref_enable
+                    mode_root = os.path.join(weight_root, mode_name)
+                    os.makedirs(mode_root, exist_ok=True)
+                    node_cmd = [
+                        "ros2", "launch", args.pkg_node, args.node_launch,
+                        f"max_vel:={args.max_vel}",
+                        f"mighty_jerk_weight:={w}",
+                        f"sample_dt:={args.sample_dt}",
+                        f"collision_dt:={args.collision_dt}",
+                        "corridorMode:=3",  # 3=batch load+run
+                        f"corridorBatchRoot:={args.corridor_root}",
+                        f"corridorBatchOutRoot:={mode_root}",
+                        f"corridorBatchStart:={args.goal_start}",
+                        f"corridorBatchCount:={args.n_runs}",
+                        "corridorBatchGoalWidth:=3",
+                        "corridorNoMap:=true",
+                        "do_benchmark:=true",
+                        f"vel_ref_enable:={'true' if vref_enable else 'false'}",
+                        f"vel_ref_knot:={args.vel_ref_knot}",
+                        f"vel_ref:=[{args.vel_ref[0]}, {args.vel_ref[1]}, {args.vel_ref[2]}]",
+                        f"vel_ref_weight:={args.vel_ref_weight}",
+                        f"mighty_freeze_enable:={'true' if freeze_enable else 'false'}",
+                        f"vel_ref_grad_check:={'true' if args.vel_ref_grad_check else 'false'}",
+                        f"vel_ref_log_every:={args.vel_ref_log_every}",
+                        f"pos_ref_enable:={'true' if pref_enable else 'false'}",
+                        f"pos_ref_knot:={args.pos_ref_knot}",
+                        f"pos_ref:=[{args.pos_ref[0]}, {args.pos_ref[1]}, {args.pos_ref[2]}]",
+                        f"pos_ref_weight:={args.pos_ref_weight}",
+                        f"pos_ref_grad_check:={'true' if args.pos_ref_grad_check else 'false'}",
+                        f"pos_ref_log_every:={args.pos_ref_log_every}",
+                    ]
+                    node = start_proc(node_cmd, f"bench_batch[{w_str}][{mode_name}]")
+                    t0 = time.time()
+                    try:
+                        if args.case_timeout > 0:
+                            total_timeout = args.case_timeout * max(1, args.n_runs)
+                            rc = node.wait(timeout=total_timeout)
+                        else:
+                            rc = node.wait()
+                    except subprocess.TimeoutExpired:
+                        print(f"[bench2] bench_batch[{w_str}][{mode_name}] timed out; killing")
+                        kill_proc_group(node, f"bench_batch[{w_str}][{mode_name}]")
+                        rc = -9
+                    print(f"[bench2] done bench_batch[{w_str}][{mode_name}] rc={rc} wall={time.time()-t0:.2f}s")
+
+                    if rc != 0:
+                        print("[bench2] non-zero rc, aborting remaining runs.")
+                        break
             else:
                 for run_idx in range(args.goal_start, args.goal_start + args.n_runs):
                     corridor_goal_dir = os.path.join(args.corridor_root, f"goal_{run_idx:03d}")
@@ -144,37 +198,52 @@ def main():
                         print(f"[bench2] missing {corridor_file}, stopping.")
                         break
 
-                    out_dir = os.path.join(weight_root, f"goal_{run_idx:03d}")
-                    os.makedirs(out_dir, exist_ok=True)
+                    for mode_name, vref_enable, freeze_enable in modes:
+                        pref_enable = args.pos_ref_enable and vref_enable
+                        out_dir = os.path.join(weight_root, mode_name, f"goal_{run_idx:03d}")
+                        os.makedirs(out_dir, exist_ok=True)
 
-                    node_cmd = [
-                        "ros2", "launch", args.pkg_node, args.node_launch,
-                        # these args still matter for dynamics/weights, even though start/goal come from file
-                        f"max_vel:={args.max_vel}",
-                        f"mighty_jerk_weight:={w}",
-                        f"sample_dt:={args.sample_dt}",
-                        f"collision_dt:={args.collision_dt}",
-                        # new args:
-                        "corridorMode:=2",  # 2=load+run
-                        f"corridorCacheFile:={corridor_file}",
-                        # export into the weight-specific goal_XXX directory:
-                        f"out_csv:={out_dir}",
-                        "corridorNoMap:=true",
-                        "do_benchmark:=true",
-                    ]
-                    node = start_proc(node_cmd, f"bench[{w_str}][{run_idx:03d}]")
-                    t0 = time.time()
-                    try:
-                        rc = node.wait(timeout=args.case_timeout) if args.case_timeout > 0 else node.wait()
-                    except subprocess.TimeoutExpired:
-                        print(f"[bench2] bench[{w_str}][{run_idx:03d}] timed out; killing")
-                        kill_proc_group(node, f"bench[{w_str}][{run_idx:03d}]")
-                        rc = -9
-                    print(f"[bench2] done bench[{w_str}][{run_idx:03d}] rc={rc} wall={time.time()-t0:.2f}s")
+                        node_cmd = [
+                            "ros2", "launch", args.pkg_node, args.node_launch,
+                            # these args still matter for dynamics/weights, even though start/goal come from file
+                            f"max_vel:={args.max_vel}",
+                            f"mighty_jerk_weight:={w}",
+                            f"sample_dt:={args.sample_dt}",
+                            f"collision_dt:={args.collision_dt}",
+                            # new args:
+                            "corridorMode:=2",  # 2=load+run
+                            f"corridorCacheFile:={corridor_file}",
+                            # export into the weight-specific goal_XXX directory:
+                            f"out_csv:={out_dir}",
+                            "corridorNoMap:=true",
+                            "do_benchmark:=true",
+                            f"vel_ref_enable:={'true' if vref_enable else 'false'}",
+                            f"vel_ref_knot:={args.vel_ref_knot}",
+                            f"vel_ref:=[{args.vel_ref[0]}, {args.vel_ref[1]}, {args.vel_ref[2]}]",
+                            f"vel_ref_weight:={args.vel_ref_weight}",
+                            f"mighty_freeze_enable:={'true' if freeze_enable else 'false'}",
+                            f"vel_ref_grad_check:={'true' if args.vel_ref_grad_check else 'false'}",
+                            f"vel_ref_log_every:={args.vel_ref_log_every}",
+                            f"pos_ref_enable:={'true' if pref_enable else 'false'}",
+                            f"pos_ref_knot:={args.pos_ref_knot}",
+                            f"pos_ref:=[{args.pos_ref[0]}, {args.pos_ref[1]}, {args.pos_ref[2]}]",
+                            f"pos_ref_weight:={args.pos_ref_weight}",
+                            f"pos_ref_grad_check:={'true' if args.pos_ref_grad_check else 'false'}",
+                            f"pos_ref_log_every:={args.pos_ref_log_every}",
+                        ]
+                        node = start_proc(node_cmd, f"bench[{w_str}][{mode_name}][{run_idx:03d}]")
+                        t0 = time.time()
+                        try:
+                            rc = node.wait(timeout=args.case_timeout) if args.case_timeout > 0 else node.wait()
+                        except subprocess.TimeoutExpired:
+                            print(f"[bench2] bench[{w_str}][{mode_name}][{run_idx:03d}] timed out; killing")
+                            kill_proc_group(node, f"bench[{w_str}][{mode_name}][{run_idx:03d}]")
+                            rc = -9
+                        print(f"[bench2] done bench[{w_str}][{mode_name}][{run_idx:03d}] rc={rc} wall={time.time()-t0:.2f}s")
 
-                    if rc != 0:
-                        print("[bench2] non-zero rc, aborting remaining runs.")
-                        break
+                        if rc != 0:
+                            print("[bench2] non-zero rc, aborting remaining runs.")
+                            break
 
     except KeyboardInterrupt:
         print("\n[bench2] Ctrl-C — shutting down.")

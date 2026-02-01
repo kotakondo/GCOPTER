@@ -82,6 +82,203 @@ inline void distribute_gTbar_to_segments(const std::vector<double> &gTbar,
     }
 }
 
+// -----------------------------------------------------------------------------
+// Hard projection for frozen velocity reference (MIGHTY)
+// -----------------------------------------------------------------------------
+void SolverLBFGS::projectFrozenVarsInPlace(Eigen::VectorXd &z) const
+{
+    if (!vel_ref_enable_ || !mighty_freeze_enable_)
+        return;
+    if (vel_ref_knot_ <= 0 || vel_ref_knot_ >= M_)
+        return;
+
+    const int voff = vhatOffset(vel_ref_knot_);
+    if (voff < 0 || voff + 2 >= z.size())
+        return;
+
+    // Compute Tbar for this knot if derivatives are scaled.
+    Vec3 vhat = vel_ref_;
+    if (scale_derivs_)
+    {
+        std::vector<double> T(M_);
+        for (int s = 0; s < M_; ++s)
+            T[s] = tau_to_T(z[offTau_ + s]);
+        std::vector<double> Tbar;
+        build_Tbar(T, Tbar);
+        const double Tb = std::max(1e-12, Tbar[vel_ref_knot_]);
+        vhat = vel_ref_ * Tb;
+    }
+
+    z.segment<3>(voff) = vhat;
+}
+
+// -----------------------------------------------------------------------------
+// Finite-difference check for the velocity reference term (isolated)
+// -----------------------------------------------------------------------------
+void SolverLBFGS::checkVelRefGradOnce(const Eigen::VectorXd &z0) const
+{
+    if (!vel_ref_grad_check_ || vel_ref_grad_check_done_)
+        return;
+    if (!vel_ref_enable_ || vel_ref_weight_ <= 0.0)
+        return;
+    if (vel_ref_knot_ <= 0 || vel_ref_knot_ >= M_)
+        return;
+
+    vel_ref_grad_check_done_ = true;
+
+    const int i = vel_ref_knot_;
+    const int voff = vhatOffset(i);
+    if (voff < 0 || voff + 2 >= z0.size())
+        return;
+
+    // Helper: compute vref-only cost from z
+    auto costOnly = [&](const Eigen::VectorXd &z) -> double
+    {
+        std::vector<double> T(M_);
+        for (int s = 0; s < M_; ++s)
+            T[s] = tau_to_T(z[offTau_ + s]);
+        std::vector<double> Tbar;
+        build_Tbar(T, Tbar);
+        const double Tb = std::max(1e-12, Tbar[i]);
+        Vec3 v;
+        if (scale_derivs_)
+            v = z.segment<3>(voff) / Tb;
+        else
+            v = z.segment<3>(voff);
+        Vec3 e = v - vel_ref_;
+        return 0.5 * vel_ref_weight_ * e.squaredNorm();
+    };
+
+    // Analytic gradient for vref-only term
+    Eigen::VectorXd g = Eigen::VectorXd::Zero(z0.size());
+    std::vector<double> T(M_);
+    for (int s = 0; s < M_; ++s)
+        T[s] = tau_to_T(z0[offTau_ + s]);
+    std::vector<double> Tbar;
+    build_Tbar(T, Tbar);
+    const double Tb = std::max(1e-12, Tbar[i]);
+    Vec3 v;
+    if (scale_derivs_)
+        v = z0.segment<3>(voff) / Tb;
+    else
+        v = z0.segment<3>(voff);
+    Vec3 e = v - vel_ref_;
+    Vec3 gV = vel_ref_weight_ * e;
+    if (scale_derivs_)
+    {
+        g.segment<3>(voff) += gV / Tb;
+
+        std::vector<double> gTbar(M_ + 1, 0.0);
+        Eigen::Map<const Vec3> vhat_i(z0.data() + voff);
+        gTbar[i] += -gV.dot(vhat_i) / (Tb * Tb);
+        std::vector<double> gTextra(M_, 0.0);
+        distribute_gTbar_to_segments(gTbar, gTextra);
+        for (int s = 0; s < M_; ++s)
+            g[offTau_ + s] += gTextra[s] * dT_dtau(z0[offTau_ + s]);
+    }
+    else
+    {
+        g.segment<3>(voff) += gV;
+    }
+
+    const double eps = 1e-6;
+    std::cout << "[MIGHTY][vref-grad] knot=" << i << " scale_derivs=" << (scale_derivs_ ? "true" : "false") << "\n";
+
+    // Check vhat components
+    for (int k = 0; k < 3; ++k)
+    {
+        Eigen::VectorXd zp = z0, zm = z0;
+        zp[voff + k] += eps;
+        zm[voff + k] -= eps;
+        const double fd = (costOnly(zp) - costOnly(zm)) / (2.0 * eps);
+        const double ad = g[voff + k];
+        const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+        const double rel = std::abs(fd - ad) / denom;
+        std::cout << "  vhat[" << k << "] fd=" << fd << " ad=" << ad << " rel=" << rel << "\n";
+    }
+
+    // Check one time variable if scaling is enabled (uses Tbar coupling)
+    if (scale_derivs_)
+    {
+        const int s_check = std::clamp(i - 1, 0, M_ - 1);
+        Eigen::VectorXd zp = z0, zm = z0;
+        zp[offTau_ + s_check] += eps;
+        zm[offTau_ + s_check] -= eps;
+        const double fd = (costOnly(zp) - costOnly(zm)) / (2.0 * eps);
+        const double ad = g[offTau_ + s_check];
+        const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+        const double rel = std::abs(fd - ad) / denom;
+        std::cout << "  tau[" << s_check << "] fd=" << fd << " ad=" << ad << " rel=" << rel << "\n";
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Finite-difference check for the position reference term (isolated)
+// -----------------------------------------------------------------------------
+void SolverLBFGS::checkPosRefGradOnce(const Eigen::VectorXd &z0) const
+{
+    if (!pos_ref_grad_check_ || pos_ref_grad_check_done_)
+        return;
+    if (!pos_ref_enable_ || pos_ref_weight_ <= 0.0)
+        return;
+    if (pos_ref_knot_ <= 0 || pos_ref_knot_ >= M_)
+        return;
+    if (!corridor_q_active_)
+        return;
+
+    const int i = pos_ref_knot_;
+    const int seam = i - 1;
+    if (seam < 0 || seam >= seamSizes_.size())
+        return;
+
+    const int k = seamSizes_(seam);
+    if (k <= 0)
+        return;
+
+    pos_ref_grad_check_done_ = true;
+
+    // Helper: compute pref-only cost from z
+    auto costOnly = [&](const Eigen::VectorXd &z) -> double
+    {
+        std::vector<Vec3> P, V, A;
+        std::vector<std::array<Vec3, 6>> CP;
+        std::vector<double> T;
+        reconstruct(z, P, V, A, CP, T);
+        Vec3 e = P[i] - pos_ref_;
+        return 0.5 * pos_ref_weight_ * e.squaredNorm();
+    };
+
+    // Analytic gradient for pref-only term
+    Eigen::VectorXd g = Eigen::VectorXd::Zero(z0.size());
+    std::vector<Vec3> P, V, A;
+    std::vector<std::array<Vec3, 6>> CP;
+    std::vector<double> T;
+    reconstruct(z0, P, V, A, CP, T);
+
+    std::vector<Vec3> gP(M_ + 1, Vec3::Zero());
+    Vec3 e = P[i] - pos_ref_;
+    gP[i] = pos_ref_weight_ * e;
+    scatterPosGrads(gP, z0, g);
+
+    const double eps = 1e-6;
+    std::cout << "[MIGHTY][pref-grad] knot=" << i << "\n";
+
+    const int off = seamOffsets_[seam];
+    const int ncheck = std::min(3, k);
+    for (int d = 0; d < ncheck; ++d)
+    {
+        const int idx = off + d;
+        Eigen::VectorXd zp = z0, zm = z0;
+        zp[idx] += eps;
+        zm[idx] -= eps;
+        const double fd = (costOnly(zp) - costOnly(zm)) / (2.0 * eps);
+        const double ad = g[idx];
+        const double denom = std::max(1e-12, std::abs(fd) + std::abs(ad));
+        const double rel = std::abs(fd - ad) / denom;
+        std::cout << "  xi[" << idx << "] fd=" << fd << " ad=" << ad << " rel=" << rel << "\n";
+    }
+}
+
 // --- GCOPTER cubic hinge (C²) and its derivative ---
 // ψ(x; μ) = 0                         , x ≤ 0
 //        = (μ - x/2) (x/μ)^3          , 0 < x < μ
@@ -350,6 +547,8 @@ void SolverLBFGS::checkGradDirectional(const VecXd &z0, int num_dirs, double eps
         if (rel > 1e-3)
             printf("\033[1;31m [dir %d] fd=%.6f ad=%.6f rel_err=%.6f \033[0m\n", k, fd, ad, rel);
     }
+
+    std::cout << "[MIGHTY][full-grad] max_rel_dir=" << max_rel_err << "\n";
 }
 
 void SolverLBFGS::checkGradCoordinates(const VecXd &z0, int max_coords, double eps, unsigned seed)
@@ -382,6 +581,8 @@ void SolverLBFGS::checkGradCoordinates(const VecXd &z0, int max_coords, double e
             printf("\033[1;31m [idx %d] g_fd=%.6f g_ad=%.6f abs_err=%.6f rel_err=%.6f \033[0m\n",
                    i, g_fd, g_ad, abserr, rel);
     }
+
+    std::cout << "[MIGHTY][full-grad] max_rel_coord=" << worst << "\n";
 }
 
 void SolverLBFGS::seamBackward(int seam,
@@ -469,6 +670,27 @@ void SolverLBFGS::initializeSolver(const planner_params_t &params, const Eigen::
     dyn_constr_bodyrate_weight_ = params.dyn_constr_bodyrate_weight;
     dyn_constr_tilt_weight_ = params.dyn_constr_tilt_weight;
     dyn_constr_thrust_weight_ = params.dyn_constr_thrust_weight;
+
+    // Velocity reference settings
+    vel_ref_enable_ = params.vel_ref_enable;
+    vel_ref_knot_ = params.vel_ref_knot;
+    vel_ref_ = Vec3(params.vel_ref.x(), params.vel_ref.y(), params.vel_ref.z());
+    vel_ref_weight_ = params.vel_ref_weight;
+    pos_ref_enable_ = params.pos_ref_enable;
+    pos_ref_knot_ = params.pos_ref_knot;
+    pos_ref_ = Vec3(params.pos_ref.x(), params.pos_ref.y(), params.pos_ref.z());
+    pos_ref_weight_ = params.pos_ref_weight;
+    mighty_freeze_enable_ = params.mighty_freeze_enable;
+    vel_ref_grad_check_ = params.vel_ref_grad_check;
+    vel_ref_grad_check_done_ = false;
+    pos_ref_grad_check_ = params.pos_ref_grad_check;
+    pos_ref_grad_check_done_ = false;
+    vel_ref_log_every_ = params.vel_ref_log_every;
+    pos_ref_log_every_ = params.pos_ref_log_every;
+    full_grad_check_enable_ = params.full_grad_check_enable;
+    full_grad_check_dirs_ = params.full_grad_check_dirs;
+    full_grad_check_max_coords_ = params.full_grad_check_max_coords;
+    full_grad_check_eps_ = params.full_grad_check_eps;
 
     // flat map
     flatmap_.reset(physical_params(0), physical_params(1), physical_params(2), physical_params(3), physical_params(4), physical_params(5));
@@ -824,9 +1046,15 @@ void SolverLBFGS::prepareSolverForReplan(double t0,
     list_z0_.clear();
     list_z0_.push_back(z0);
 
-    // wherever you have a valid z (e.g., right before starting L-BFGS)
-    checkGradDirectional(z0, /*num_dirs=*/8, /*eps=*/1e-5, /*seed=*/42);
-    checkGradCoordinates(z0, /*max_coords=*/256, /*eps=*/1e-5, /*seed=*/43);
+    // optional full objective gradient checks
+    if (full_grad_check_enable_)
+    {
+        const int dirs = std::max(1, full_grad_check_dirs_);
+        const int maxc = std::max(1, full_grad_check_max_coords_);
+        const double eps = (full_grad_check_eps_ > 0.0 ? full_grad_check_eps_ : 1e-5);
+        checkGradDirectional(z0, /*num_dirs=*/dirs, /*eps=*/eps, /*seed=*/42);
+        checkGradCoordinates(z0, /*max_coords=*/maxc, /*eps=*/eps, /*seed=*/43);
+    }
 
     // {
     //     Eigen::VectorXd g_old(z0.size()), g_new(z0.size());
@@ -1760,6 +1988,31 @@ double SolverLBFGS::evaluateObjectiveAndGradientFused(
     }
     const int knots = M + 1;
 
+    // Optional: hard-freeze velocity at a specific knot
+    if (vel_ref_enable_ && mighty_freeze_enable_ && vel_ref_knot_ > 0 && vel_ref_knot_ < M)
+    {
+        const int i = vel_ref_knot_;
+        V[i] = vel_ref_;
+
+        auto updateCP = [&](int s)
+        {
+            if (s < 0 || s >= M)
+                return;
+            const Vec3 &p0 = P[s], &v0s = V[s], &a0s = A[s];
+            const Vec3 &p1 = P[s + 1], &v1s = V[s + 1], &a1s = A[s + 1];
+            const double Ts = T[s], T2 = Ts * Ts;
+            auto &c = CP[s];
+            c[0] = p0;
+            c[1] = p0 + (Ts / 5.0) * v0s;
+            c[2] = p0 + (2.0 * Ts / 5.0) * v0s + (T2 / 20.0) * a0s;
+            c[3] = p1 - (2.0 * Ts / 5.0) * v1s + (T2 / 20.0) * a1s;
+            c[4] = p1 - (Ts / 5.0) * v1s;
+            c[5] = p1;
+        };
+        updateCP(i - 1);
+        updateCP(i);
+    }
+
     // =========================================================================
     // Precompute shape bases (Bernstein) once for the chosen integral resolution
     // =========================================================================
@@ -1776,6 +2029,8 @@ double SolverLBFGS::evaluateObjectiveAndGradientFused(
     double J_om = 0.0;   // body-rate limit
     double J_tilt = 0.0; // tilt limit
     double J_thr = 0.0;  // thrust ring
+    double J_vref = 0.0; // velocity reference (already weighted)
+    double J_pref = 0.0; // position reference (already weighted)
 
     for (double Ts : T)
         J_time += Ts;
@@ -1796,6 +2051,42 @@ double SolverLBFGS::evaluateObjectiveAndGradientFused(
     std::vector<Vec3> gV(knots, Vec3::Zero());
     std::vector<Vec3> gA(knots, Vec3::Zero());
     std::vector<double> gT(M, 0.0);
+
+    // Velocity reference soft cost (knot velocity)
+    if (vel_ref_enable_ && vel_ref_weight_ > 0.0 && vel_ref_knot_ > 0 && vel_ref_knot_ < M)
+    {
+        const int i = vel_ref_knot_;
+        const Vec3 e = V[i] - vel_ref_;
+        J_vref = 0.5 * vel_ref_weight_ * e.squaredNorm();
+        gV[i] += vel_ref_weight_ * e;
+        last_vref_v_ = V[i];
+        last_vref_err_ = e.norm();
+        last_vref_cost_ = J_vref;
+    }
+    else
+    {
+        last_vref_v_.setZero();
+        last_vref_err_ = 0.0;
+        last_vref_cost_ = 0.0;
+    }
+
+    // Position reference soft cost (knot position)
+    if (pos_ref_enable_ && pos_ref_weight_ > 0.0 && pos_ref_knot_ > 0 && pos_ref_knot_ < M)
+    {
+        const int i = pos_ref_knot_;
+        const Vec3 e = P[i] - pos_ref_;
+        J_pref = 0.5 * pos_ref_weight_ * e.squaredNorm();
+        gP[i] += pos_ref_weight_ * e;
+        last_pref_p_ = P[i];
+        last_pref_err_ = e.norm();
+        last_pref_cost_ = J_pref;
+    }
+    else
+    {
+        last_pref_p_.setZero();
+        last_pref_err_ = 0.0;
+        last_pref_cost_ = 0.0;
+    }
 
     Eigen::setNbThreads(1);
 
@@ -2207,7 +2498,20 @@ double SolverLBFGS::evaluateObjectiveAndGradientFused(
         dyn_constr_vel_weight_ * J_vel +
         dyn_constr_bodyrate_weight_ * J_om +
         dyn_constr_tilt_weight_ * J_tilt +
-        dyn_constr_thrust_weight_ * J_thr;
+        dyn_constr_thrust_weight_ * J_thr +
+        J_vref +
+        J_pref;
+
+    // stash breakdown for logging
+    last_J_time_ = J_time;
+    last_J_jerk_ = J_jerk;
+    last_J_stat_ = J_stat;
+    last_J_vel_ = J_vel;
+    last_J_om_ = J_om;
+    last_J_tilt_ = J_tilt;
+    last_J_thr_ = J_thr;
+    last_J_vref_ = J_vref;
+    last_J_pref_ = J_pref;
 
     return f;
 }
@@ -2228,6 +2532,22 @@ double SolverLBFGS::evaluateObjective(const VecXd &z)
     for (double Ts : T)
         J_time += Ts;
 
+    // ---- vref (knot velocity) ----
+    double J_vref = 0.0;
+    if (vel_ref_enable_ && vel_ref_weight_ > 0.0 && vel_ref_knot_ > 0 && vel_ref_knot_ < M)
+    {
+        const Vec3 e = V[vel_ref_knot_] - vel_ref_;
+        J_vref = 0.5 * vel_ref_weight_ * e.squaredNorm();
+    }
+
+    // ---- pref (knot position) ----
+    double J_pref = 0.0;
+    if (pos_ref_enable_ && pos_ref_weight_ > 0.0 && pos_ref_knot_ > 0 && pos_ref_knot_ < M)
+    {
+        const Vec3 e = P[pos_ref_knot_] - pos_ref_;
+        J_pref = 0.5 * pos_ref_weight_ * e.squaredNorm();
+    }
+
     // ---- 2) jerk (closed form per segment) ----
     double J_jerk = 0.0;
     for (int s = 0; s < M; ++s)
@@ -2243,7 +2563,7 @@ double SolverLBFGS::evaluateObjective(const VecXd &z)
     // ---- 3) sampled terms in s ∈ [0,1] with dt = T_s / kappa (trapezoid) ----
     const int kappa = (integral_resolution_ > 0 ? integral_resolution_ : 30);
     if (kappa <= 0)
-        return time_weight_ * J_time + jerk_weight_ * J_jerk;
+        return time_weight_ * J_time + jerk_weight_ * J_jerk + J_vref + J_pref;
 
     const double mu = (hinge_mu_ > 0.0 ? hinge_mu_ : 1e-2);
     const double Vmax2 = V_max_ * V_max_;
@@ -2353,7 +2673,39 @@ double SolverLBFGS::evaluateObjective(const VecXd &z)
     }
 
     // final weighted sum (add the 4 new terms)
-    return time_weight_ * J_time + jerk_weight_ * J_jerk + stat_weight_ * J_stat + dyn_constr_vel_weight_ * J_vel + dyn_constr_bodyrate_weight_ * J_om + dyn_constr_tilt_weight_ * J_tilt + dyn_constr_thrust_weight_ * J_thr;
+    return time_weight_ * J_time + jerk_weight_ * J_jerk + stat_weight_ * J_stat +
+           dyn_constr_vel_weight_ * J_vel + dyn_constr_bodyrate_weight_ * J_om +
+           dyn_constr_tilt_weight_ * J_tilt + dyn_constr_thrust_weight_ * J_thr +
+           J_vref + J_pref;
+}
+
+// -----------------------------------------------------------------------------
+
+void SolverLBFGS::printObjectiveBreakdown(const std::string &tag) const
+{
+    const double total =
+        time_weight_ * last_J_time_ +
+        jerk_weight_ * last_J_jerk_ +
+        stat_weight_ * last_J_stat_ +
+        dyn_constr_vel_weight_ * last_J_vel_ +
+        dyn_constr_bodyrate_weight_ * last_J_om_ +
+        dyn_constr_tilt_weight_ * last_J_tilt_ +
+        dyn_constr_thrust_weight_ * last_J_thr_ +
+        last_J_vref_ +
+        last_J_pref_;
+
+    std::cout << "[" << tag << "][obj] "
+              << "J_time=" << last_J_time_
+              << " J_jerk=" << last_J_jerk_
+              << " J_stat=" << last_J_stat_
+              << " J_vel=" << last_J_vel_
+              << " J_om=" << last_J_om_
+              << " J_tilt=" << last_J_tilt_
+              << " J_thr=" << last_J_thr_
+              << " J_vref=" << last_J_vref_
+              << " J_pref=" << last_J_pref_
+              << " total=" << total
+              << "\n";
 }
 
 // -----------------------------------------------------------------------------
@@ -2390,6 +2742,46 @@ void SolverLBFGS::computeAnalyticalGrad(const Eigen::VectorXd &z, Eigen::VectorX
         dJ_limits_and_static_dz(z, P, V, A, CP, T, g); // thrust update is inside this helper
         grad += g;                                     // weights applied per-term inside the helper
     }
+
+    // 4) velocity reference (knot velocity)
+    if (vel_ref_enable_ && vel_ref_weight_ > 0.0 && vel_ref_knot_ > 0 && vel_ref_knot_ < M_)
+    {
+        const int i = vel_ref_knot_;
+        const Vec3 e = V[i] - vel_ref_;
+        const Vec3 gV = vel_ref_weight_ * e;
+
+        if (scale_derivs_)
+        {
+            std::vector<double> Tbar;
+            build_Tbar(T, Tbar);
+            const double Tb = std::max(1e-12, Tbar[i]);
+            const int voff = vhatOffset(i);
+            grad.segment<3>(voff) += gV / Tb;
+
+            std::vector<double> gTbar(M_ + 1, 0.0);
+            Eigen::Map<const Vec3> vhat_i(z.data() + voff);
+            gTbar[i] += -gV.dot(vhat_i) / (Tb * Tb);
+            std::vector<double> gTextra(M_, 0.0);
+            distribute_gTbar_to_segments(gTbar, gTextra);
+            for (int s = 0; s < M_; ++s)
+                grad[offTau_ + s] += gTextra[s] * dT_dtau(z[offTau_ + s]);
+        }
+        else
+        {
+            const int voff = vhatOffset(i);
+            grad.segment<3>(voff) += gV;
+        }
+    }
+
+    // 5) position reference (knot position)
+    if (pos_ref_enable_ && pos_ref_weight_ > 0.0 && pos_ref_knot_ > 0 && pos_ref_knot_ < M_)
+    {
+        const int i = pos_ref_knot_;
+        const Vec3 e = P[i] - pos_ref_;
+        std::vector<Vec3> gP(M_ + 1, Vec3::Zero());
+        gP[i] = pos_ref_weight_ * e;
+        scatterPosGrads(gP, z, grad);
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2399,14 +2791,60 @@ int SolverLBFGS::progressCallback(void *instance,
                                   const Eigen::VectorXd &g,
                                   const double f,
                                   const double /*step*/,
-                                  const int /*k*/,
+                                  const int k,
                                   const int /*ls*/)
 {
     auto *self = static_cast<SolverLBFGS *>(instance);
 
+    // Ensure frozen knot stays projected (in-place on the optimizer's x)
+    if (self->vel_ref_enable_ && self->mighty_freeze_enable_)
+    {
+        Eigen::VectorXd &z_mut = const_cast<Eigen::VectorXd &>(z);
+        self->projectFrozenVarsInPlace(z_mut);
+    }
+
     // Remember the latest iterate and objective (so we can return it if we abort)
     self->last_z_ = z;
     self->last_f_ = f;
+
+    const bool log_vref = self->vel_ref_enable_ && self->vel_ref_log_every_ > 0 &&
+                          (k % self->vel_ref_log_every_ == 0);
+    const bool log_pref = self->pos_ref_enable_ && self->pos_ref_log_every_ > 0 &&
+                          (k % self->pos_ref_log_every_ == 0);
+    if (log_vref || log_pref)
+    {
+        std::cout << "[MIGHTY][iter " << k << "] ";
+        if (log_vref)
+        {
+            std::cout << "vref_knot=" << self->vel_ref_knot_
+                      << " v_i=" << self->last_vref_v_.transpose()
+                      << " |e|=" << self->last_vref_err_
+                      << " J_vref=" << self->last_vref_cost_;
+        }
+        if (log_pref)
+        {
+            if (log_vref)
+                std::cout << " ";
+            std::cout << "pref_knot=" << self->pos_ref_knot_
+                      << " p_i=" << self->last_pref_p_.transpose()
+                      << " |e_p|=" << self->last_pref_err_
+                      << " J_pref=" << self->last_pref_cost_;
+        }
+        std::cout << " f=" << f
+                  << " freeze=" << (self->mighty_freeze_enable_ ? "true" : "false")
+                  << "\n";
+        std::cout << "  [MIGHTY][obj] "
+                  << "J_time=" << self->last_J_time_
+                  << " J_jerk=" << self->last_J_jerk_
+                  << " J_stat=" << self->last_J_stat_
+                  << " J_vel=" << self->last_J_vel_
+                  << " J_om=" << self->last_J_om_
+                  << " J_tilt=" << self->last_J_tilt_
+                  << " J_thr=" << self->last_J_thr_
+                  << " J_vref=" << self->last_J_vref_
+                  << " J_pref=" << self->last_J_pref_
+                  << "\n";
+    }
 
     if (self->have_deadline_)
     {
@@ -2430,8 +2868,22 @@ double SolverLBFGS::evalObjGradCallback(
     const Eigen::VectorXd &x,
     Eigen::VectorXd &g)
 {
+    auto *self = static_cast<SolverLBFGS *>(instance);
+
+    // Hard projection for frozen velocity (must mutate x in-place)
+    if (self->vel_ref_enable_ && self->mighty_freeze_enable_)
+    {
+        Eigen::VectorXd &x_mut = const_cast<Eigen::VectorXd &>(x);
+        self->projectFrozenVarsInPlace(x_mut);
+    }
+
+    // Optional one-shot gradient check for the vref term
+    self->checkVelRefGradOnce(x);
+    // Optional one-shot gradient check for the pref term
+    self->checkPosRefGradOnce(x);
+
     // dispatch into the instance
-    return static_cast<SolverLBFGS *>(instance)->evaluateObjectiveAndGradientFused(x, g);
+    return self->evaluateObjectiveAndGradientFused(x, g);
     // return static_cast<SolverLBFGS *>(instance)->evaluateObjectiveAndGradient(x, g);
 }
 
@@ -2445,14 +2897,17 @@ int SolverLBFGS::optimize(
 {
     // copy initial guess
     Eigen::VectorXd z = z0;
+    if (vel_ref_enable_ && mighty_freeze_enable_)
+        projectFrozenVarsInPlace(z);
 
     int status = lbfgs::lbfgs_optimize(
         z,                                 // in/out decision vector
         f_opt,                             // out final cost
         &SolverLBFGS::evalObjGradCallback, // objective+gradient callback
         /*stepbound*/ nullptr,
-        // /*progress*/ &SolverLBFGS::progressCallback,
-        /*progress*/ nullptr,
+        /*progress*/ (vel_ref_enable_ && vel_ref_log_every_ > 0) || mighty_freeze_enable_ || verbose_
+            ? &SolverLBFGS::progressCallback
+            : nullptr,
         const_cast<SolverLBFGS *>(this),
         param);
 
@@ -2471,6 +2926,8 @@ int SolverLBFGS::optimize(const Eigen::VectorXd &z0,
 {
     // copy initial guess
     Eigen::VectorXd z = z0;
+    if (vel_ref_enable_ && mighty_freeze_enable_)
+        projectFrozenVarsInPlace(z);
 
     // Set up deadline and reset bookkeeping
     opt_start_ = std::chrono::steady_clock::now();

@@ -34,6 +34,7 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr mighty_traj_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr mighty_text_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr mighty_sphere_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr trajectoryColoredPub_;
 
 public:
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr speedPub;
@@ -59,6 +60,80 @@ public:
         mighty_traj_pub_ = node_.create_publisher<visualization_msgs::msg::Marker>("/visualizer/mighty/trajectory", 10);
         mighty_text_pub_ = node_.create_publisher<visualization_msgs::msg::Marker>("/visualizer/mighty/vel_text", 10);
         mighty_sphere_pub_ = node_.create_publisher<visualization_msgs::msg::Marker>("/visualizer/mighty/spheres", 10);
+        trajectoryColoredPub_ = node_.create_publisher<visualization_msgs::msg::Marker>("/visualizer/trajectory_colored", 10);
+    }
+
+    // Velocity-colored trajectory visualization for GCOPTER
+    template <int D>
+    inline void visualizeTrajectoryColored(const Trajectory<D> &traj,
+                                           double v_max = -1.0,
+                                           double width = 0.3,
+                                           const std::string &frame_id = "odom")
+    {
+        if (traj.getPieceNum() <= 0)
+            return;
+
+        // First pass: find max speed if v_max not provided
+        double vmax_used = v_max;
+        if (vmax_used <= 0.0)
+        {
+            double vmax_obs = 1e-9;
+            const double dt = 0.01;
+            for (double t = 0.0; t < traj.getTotalDuration(); t += dt)
+            {
+                double speed = traj.getVel(t).norm();
+                vmax_obs = std::max(vmax_obs, speed);
+            }
+            vmax_used = vmax_obs;
+        }
+
+        visualization_msgs::msg::Marker mk;
+        mk.header.stamp = node_.now();
+        mk.header.frame_id = frame_id;
+        mk.ns = "trajectory_colored";
+        mk.id = 0;
+        mk.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        mk.action = visualization_msgs::msg::Marker::ADD;
+        mk.pose.orientation.w = 1.0;
+        mk.scale.x = width;
+        mk.lifetime = rclcpp::Duration(0, 0); // persistent
+
+        const double dt = 0.01;
+        int n_samples = static_cast<int>(traj.getTotalDuration() / dt) + 1;
+        mk.points.reserve(n_samples);
+        mk.colors.reserve(n_samples);
+
+        for (double t = 0.0; t < traj.getTotalDuration(); t += dt)
+        {
+            Eigen::Vector3d pos = traj.getPos(t);
+            double speed = traj.getVel(t).norm();
+
+            geometry_msgs::msg::Point p;
+            p.x = pos.x();
+            p.y = pos.y();
+            p.z = pos.z();
+            mk.points.push_back(p);
+
+            std_msgs::msg::ColorRGBA c = getColorJet(speed, 0.0, vmax_used);
+            mk.colors.push_back(c);
+        }
+
+        // Add final point
+        {
+            Eigen::Vector3d pos = traj.getPos(traj.getTotalDuration());
+            double speed = traj.getVel(traj.getTotalDuration()).norm();
+
+            geometry_msgs::msg::Point p;
+            p.x = pos.x();
+            p.y = pos.y();
+            p.z = pos.z();
+            mk.points.push_back(p);
+
+            std_msgs::msg::ColorRGBA c = getColorJet(speed, 0.0, vmax_used);
+            mk.colors.push_back(c);
+        }
+
+        trajectoryColoredPub_->publish(mk);
     }
 
     template <int D>

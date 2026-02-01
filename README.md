@@ -43,6 +43,13 @@ colcon build --merge-install --symlink-install   --parallel-workers $J   --cmake
 python3 src/GCOPTER/gcopter/scripts/bench_simple.py
 ```
 
+### Velocity Reference Experiment (vref at a knot)
+
+Set these ROS params (e.g., in `gcopter/config/global_planning.yaml` or via launch args):
+- Baseline (no vref): `VelRefEnable: false`
+- Soft vref only: `VelRefEnable: true`, `VelRefKnot: <interior index>`, `VelRef: [0,0,0]`, `VelRefWeight: <w>`
+- MIGHTY-freeze (hard + soft): `VelRefEnable: true`, `MIGHTYFreezeEnable: true` (GCOPTER ignores the freeze flag)
+
 ### Run Sweep Benchmark (simple case)
 
 First, cache the corridors:
