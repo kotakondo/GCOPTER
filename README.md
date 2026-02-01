@@ -61,6 +61,32 @@ Then run the sweep benchmark:
 python3 src/GCOPTER/gcopter/scripts/bench_from_corridors.py --use_cpp_batch --n_runs 100 --goal_start 0
 ```
 
+### Run Reference Position and Velocity Benchmark
+
+This benchmark tests trajectory optimization with reference position and velocity constraints. The command below uses cached corridors and evaluates performance with soft constraints at all knots:
+
+```bash
+python3 src/GCOPTER/gcopter/scripts/bench_from_corridors.py \
+  --corridor_root /media/kkondo/T7/mighty_gcopter_bench/simple_bench/corridor_cache \
+  --out_root /media/kkondo/T7/mighty_gcopter_bench/simple_bench \
+  --n_runs 100 --goal_start 0 \
+  --max_vel 2.0 --mighty_jerk_weight 1e-5 \
+  --vel_ref 0 0 0 \
+  --vel_ref_weight 1000.0 --pos_ref_weight 1000.0 \
+  --vel_ref_knot -1 --use_cpp_batch --skip_freeze --skip_baseline \
+  --no_sweep_mighty_jerk_weight --pos_ref_enable
+```
+
+Key parameters:
+- `--vel_ref 0 0 0`: Target reference velocity (hovering in this case)
+- `--vel_ref_weight 1000.0`: Weight for velocity reference soft constraint
+- `--pos_ref_weight 1000.0`: Weight for position reference soft constraint
+- `--vel_ref_knot -1`: Apply velocity reference at all knots (-1 = all knots)
+- `--pos_ref_enable`: Enable position reference constraints
+- `--skip_freeze`: Skip MIGHTY-freeze variant (hard constraint)
+- `--skip_baseline`: Skip baseline GCOPTER without references
+- `--no_sweep_mighty_jerk_weight`: Don't sweep over jerk weight values
+
 ### Run Benchmark (complex case)
 
 ```bash
